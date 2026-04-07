@@ -1,0 +1,198 @@
+[English](README.md) | [中文](README_CN.md)
+
+# AWS FIS 实验准备
+
+一个 Agent Skill，用于生成运行 AWS FIS（Fault Injection Service）实验所需的全部配置文件，然后**通过 CloudFormation 部署并自动修复迭代**，直到 Stack 创建成功。
+
+## 问题背景
+
+手动准备 AWS FIS 实验涉及多个容易出错且繁琐的步骤：
+
+- **资源与 Action 的兼容性不直观** — 例如 `aws:rds:failover-db-cluster` 需要 Aurora 集群（`aws:rds:cluster`），不支持独立 RDS 实例。不匹配问题往往在实验启动时才被发现，浪费了之前所有的准备工作。
+- **多个文件必须生成且保持一致** — 实验模板 JSON、IAM 策略、CloudFormation 模板、CloudWatch 告警、Dashboard 以及预期行为文档都引用相同的资源 ARN 和参数。
+- **CloudFormation 部署经常失败** — 属性校验错误、IAM 传播延迟、Region 资源限制等需要反复调试，手动处理非常耗时。
+- **Scenario Library 场景很复杂** — 复合场景（如 AZ 电力中断）编排多个 sub-action，有特定的标签要求和目标类型，容易配错。
+- **Scenario Library 模板无法通过 API 生成** — 与自定义单个 FIS Action 不同，4 个 Scenario Library 场景没有 CLI/API 命令来自动生成实验模板。JSON 模板必须从 AWS 文档中提取。
+
+## 核心功能
+
+1. **识别场景** — 判断用户需要 Scenario Library 预定义场景（AZ 电力中断、AZ 应用慢速等）还是自定义单个 FIS Action。
+2. **读取 Scenario Library 文档** — 对于 Scenario Library 场景，读取 AWS 文档页面以提取 JSON 实验模板（这些模板无法通过 API 生成）。文档 URL：
+   - [AZ 电力中断](https://docs.aws.amazon.com/en_us/fis/latest/userguide/az-availability-scenario.html)
+   - [AZ 应用慢速](https://docs.aws.amazon.com/en_us/fis/latest/userguide/az-application-slowdown-scenario.html)
+   - [跨 AZ 流量慢速](https://docs.aws.amazon.com/en_us/fis/latest/userguide/cross-az-traffic-slowdown-scenario.html)
+   - [跨 Region 连接](https://docs.aws.amazon.com/en_us/fis/latest/userguide/cross-region-scenario.html)
+3. **发现目标资源** — 查询用户实际的 AWS 资源，收集目标标识。
+3. **验证兼容性** — 通过 AWS CLI 检查实际资源（如 `describe-db-instances`、`describe-db-clusters`），与 FIS Action 的 `resourceType` 要求交叉校验，在生成任何文件之前完成。
+4. **确定监控配置** — 默认使用 `source: "none"`（不绑定 Stop Condition 告警）。仅在用户明确提供告警时才创建 CloudWatch Alarm。生成包含各服务可用性、性能和错误/延迟指标的综合 CloudWatch Dashboard。
+5. **生成配置文件** — 生成包含 6 个文件的自包含目录：实验模板、IAM 策略、CFN 模板、告警、Dashboard 和 README。
+6. **自动修复部署** — 部署 CFN 模板，若部署失败则自动分析错误、修复模板、删除失败 Stack、重试（最多 5 次）。
+7. **保存摘要报告** — 将准备结果写入本地 Markdown 文件（`YYYY-mm-dd-HH-MM-SS-{scenario}-prepare-summary.md`），终端仅打印简要摘要。
+
+## 支持的场景
+
+### Scenario Library（复合、多 Action）
+
+| 场景 | 主要 Sub-Action |
+|---|---|
+| AZ 可用性：电力中断 | EC2 停止、RDS 故障转移、ElastiCache AZ 断电、EBS 暂停、网络中断 |
+| AZ：应用慢速 | Pod 网络延迟、EBS 延迟、网络中断 |
+| 跨 AZ：流量慢速 | 跨 AZ 网络延迟 / 丢包 |
+| 跨 Region：连接 | 跨 Region 网络中断 |
+| EC2 压力测试 | 实例故障、CPU、内存、磁盘、网络延迟 |
+| EKS 压力测试 | Pod 删除、CPU、磁盘、内存、网络延迟 |
+| EBS 延迟 | 持续、递增、间歇、递减 |
+
+### 自定义 FIS Action（单个 Action）
+
+任何有效的 FIS Action ID，例如：
+- `aws:rds:failover-db-cluster`
+- `aws:ec2:stop-instances`
+- `aws:elasticache:replicationgroup-interrupt-az-power`
+- `aws:eks:pod-network-latency`
+
+## 输出目录结构
+
+```
+./{scenario-slug}-{yyyy-mm-dd-HH-MM-SS}/
+├── README.md                          # 实验概览和执行说明
+├── experiment-template.json           # FIS 实验模板（CLI 创建用）
+├── iam-policy.json                    # 最小权限 IAM 策略
+├── cfn-template.yaml                  # 全包 CloudFormation 模板
+└── alarms/
+    ├── stop-condition-alarms.json     # CloudWatch 告警定义
+    └── dashboard.json                 # CloudWatch Dashboard 定义
+```
+
+另外，摘要报告保存为：
+```
+./YYYY-mm-dd-HH-MM-SS-{scenario}-prepare-summary.md
+```
+
+## 资源-Action 兼容性验证
+
+本 Skill 的关键特性：在生成任何文件**之前**验证资源兼容性。
+
+| FIS Action | 要求的 resourceType | 不兼容的情况 |
+|---|---|---|
+| `aws:rds:failover-db-cluster` | `aws:rds:cluster` | 独立 RDS 实例（非 Aurora） |
+| `aws:rds:reboot-db-instances` | `aws:rds:db` | Aurora 集群（应使用 failover） |
+| `aws:elasticache:replicationgroup-interrupt-az-power` | `aws:elasticache:replicationgroup` | 独立 ElastiCache 节点 |
+| `aws:ec2:stop-instances` | `aws:ec2:instance` | Spot 实例（可能终止而非停止） |
+| `aws:eks:pod-network-latency` | `aws:eks:pod` | 缺少所需插件的集群 |
+
+发现不兼容时，Skill 会解释不匹配的原因并建议替代方案。
+
+## 自动修复 CFN 部署
+
+生成文件后，Skill 立即部署 CloudFormation 模板：
+
+1. **权限预检** — 检查调用者 IAM 策略中 CreateStack/UpdateStack/DeleteStack 是否有 `cloudformation:RoleArn` 条件。如有，提取 CFN 服务角色 ARN 并在后续所有 CFN 命令中自动添加 `--role-arn`。
+2. **验证** — `aws cloudformation validate-template`
+3. **部署** — `aws cloudformation deploy --capabilities CAPABILITY_NAMED_IAM`（如需要则带 `--role-arn`）
+4. **失败时** — 从 Stack 事件提取错误、分析根因、修复模板、删除失败 Stack、重试
+5. **最多 5 次重试** — 仍然失败则报告所有尝试过的修复
+6. **成功后** — 用 Stack 输出中的真实 ARN 更新本地文件
+
+## 前置条件
+
+- **AWS CLI** (`aws`) — 资源发现、FIS Action 验证、CFN 部署。需要 FIS、IAM、CloudWatch、CloudFormation 权限。
+- [**aws-knowledge-mcp-server**](https://github.com/awslabs/mcp/tree/main/src/aws-knowledge-mcp-server) — Scenario Library 文档研究（`aws___search_documentation`、`aws___read_documentation`）
+- **jq** — JSON 处理（可选但推荐）
+
+### 创建 CloudFormation 服务角色
+
+本 Skill 通过 CloudFormation 部署 Stack，其中包含 IAM 角色、CloudWatch 资源和 FIS 实验模板。建议创建专用的 CloudFormation 服务角色，而不是使用自身的宽泛权限。
+
+参见配置指南：https://panlm.github.io/others/cfn-service-role-for-fis-experiment-setup-guide/
+
+部署 Stack 时传入 `--role-arn`：
+
+```bash
+aws cloudformation deploy \
+  --template-file cfn-template.yaml \
+  --stack-name <stack-name> \
+  --role-arn arn:aws:iam::<account-id>:role/CloudFormationFISServiceRole \
+  --capabilities CAPABILITY_NAMED_IAM \
+  --region <region>
+```
+
+> **好处：** 调用者只需 `cloudformation:*` 和 `iam:PassRole` 权限，所有资源创建都委托给服务角色，缩小影响范围。
+
+## 工作流程概览
+
+```
+步骤 1: 识别场景 + Region
+         ↓
+步骤 2: 发现目标资源
+         ├── Scenario Library → 必须先读取 AWS 文档（JSON 模板无法通过 API 获取）
+         └── 自定义 FIS Action → 通过 `aws fis get-action` 查询
+         ↓
+步骤 3: 验证资源-Action 兼容性 [关键门控]
+         ├── 兼容 → 继续
+         └── 不兼容 → 建议替代方案 → 用户确认或中止
+         ↓
+步骤 4: 确定监控配置（Stop Condition + Dashboard 指标）
+         ↓
+步骤 5: 在输出目录中生成 6 个配置文件
+         ↓
+步骤 5.5: CFN 权限预检（检测 cloudformation:RoleArn 条件）
+         ↓
+步骤 6: 部署 CFN 模板并自动修复（最多 5 次重试）
+         ├── 成功 → 用真实 ARN 更新本地文件
+         └── 失败 → 报告错误和所有尝试过的修复
+         ↓
+步骤 7: 保存摘要报告到本地文件 (YYYY-mm-dd-HH-MM-SS-{scenario}-prepare-summary.md)
+```
+
+## 使用示例
+
+```
+"Prepare an AZ Power Interruption experiment for us-east-1a"
+"Create FIS experiment for aws:rds:failover-db-cluster targeting my Aurora cluster"
+"准备 FIS 实验，测试 AZ 断电对 EKS 和 RDS 的影响"
+"生成 EC2 CPU 压力测试的混沌实验配置"
+"为 ap-southeast-1 的 ElastiCache 故障转移配置故障注入测试"
+```
+
+## 关键设计决策
+
+1. **先验证再生成。** 在生成任何文件之前检查资源-Action 兼容性。避免常见的反模式：生成完整配置、部署 Stack，结果在实验启动时才发现不匹配。
+
+2. **Scenario Library 模板来自文档。** 4 个 Scenario Library 场景（AZ 电力中断、AZ 应用慢速、跨 AZ 流量慢速、跨 Region 连接）无法通过 FIS API 生成。Skill 读取 AWS 官方文档页面提取 JSON 实验模板，这是正确的多 Action 模板结构的唯一权威来源。
+
+3. **自动修复部署循环。** CFN 错误自动分析并修复，而非报告给用户。目标是交付一个可用的、已部署的实验模板，不只是可能能用的文件。
+
+4. **全包 CFN 模板。** `cfn-template.yaml` 包含 IAM 角色、告警、Dashboard 和实验模板。一次 `cloudformation deploy` 即可完成所有部署。
+
+5. **本地文件保持同步。** 部署成功后，`experiment-template.json` 和 `README.md` 会用真实 ARN 和 Stack 输出更新，使目录成为已部署实验的准确记录。
+
+6. **绝不启动实验。** 本 Skill 只准备和部署基础设施。启动实际实验由 [aws-fis-experiment-execute](../aws-fis-experiment-execute/) 或用户手动完成。
+
+7. **报告保存到文件。** 准备摘要写入带时间戳前缀的本地 Markdown 文件，终端输出保持简洁。
+
+## 目录结构
+
+```
+aws-fis-experiment-prepare/
+├── SKILL.md                              # Skill 主定义文件（Agent 执行指令）
+├── README.md                             # 英文版 PRD / 用户文档
+├── README_CN.md                          # 本文件（中文版）
+└── references/
+    ├── output-structure.md               # 6 个输出文件的格式规范
+    └── scenario-templates.md             # FIS Scenario Library JSON 模板示例
+```
+
+## 已知限制
+
+- 依赖具有足够权限的 AWS CLI 访问（FIS、IAM、CloudWatch、CloudFormation）。
+- Scenario Library 文档在执行时读取；新增场景需要重新运行。
+- 自动修复循环处理常见 CFN 错误，但可能无法解决权限或账号级配额限制。
+- 复合场景要求资源预先打好场景专用标签（如 `AzImpairmentPower: StopInstances`）。
+- 顺序 MCP 文档研究调用需要约 10-20 秒。
+
+## 相关 Skill
+
+- [aws-service-chaos-research](../aws-service-chaos-research/) — 为任意 AWS 服务研究混沌测试场景（本 Skill 之前运行）
+- [aws-fis-experiment-execute](../aws-fis-experiment-execute/) — 部署并运行已准备好的实验（本 Skill 之后运行）
+- [eks-workload-best-practice-assessment](../eks-workload-best-practice-assessment/) — 评估 EKS 工作负载配置

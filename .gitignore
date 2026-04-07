@@ -1,0 +1,29 @@
+# OS
+.DS_Store
+Thumbs.db
+
+# Editor/IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Agent state
+.claude/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Secrets (预防性)
+.env
+.env.*
+*.pem
+*.key
+
+# Generated state
+.upstream-state.json
+.skill-registry.json
