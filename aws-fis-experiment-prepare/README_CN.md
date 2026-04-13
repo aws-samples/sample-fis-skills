@@ -25,9 +25,10 @@
 3. **发现目标资源** — 查询用户实际的 AWS 资源，收集目标标识。
 3. **验证兼容性** — 通过 AWS CLI 检查实际资源（如 `describe-db-instances`、`describe-db-clusters`），与 FIS Action 的 `resourceType` 要求交叉校验，在生成任何文件之前完成。
 4. **确定监控配置** — 默认使用 `source: "none"`（不绑定 Stop Condition 告警）。仅在用户明确提供告警时才创建 CloudWatch Alarm。生成包含各服务可用性、性能和错误/延迟指标的综合 CloudWatch Dashboard。
-5. **生成配置文件** — 生成包含 6 个文件的自包含目录：实验模板、IAM 策略、CFN 模板、告警、Dashboard 和 README。
-6. **自动修复部署** — 部署 CFN 模板，若部署失败则自动分析错误、修复模板、删除失败 Stack、重试（最多 5 次）。
-7. **保存摘要报告** — 将准备结果写入本地 Markdown 文件（`YYYY-mm-dd-HH-MM-SS-{scenario}-prepare-summary.md`），终端仅打印简要摘要。
+5. **读取 CFN 资源文档** — 在生成 CFN 模板之前，读取 `AWS::FIS::ExperimentTemplate` CloudFormation 文档，确保模板使用当前的属性 schema。
+6. **生成配置文件** — 生成包含 6 个文件的自包含目录：实验模板、IAM 策略、CFN 模板、告警、Dashboard 和 README。
+7. **自动修复部署** — 部署 CFN 模板，若部署失败则自动分析错误、修复模板、删除失败 Stack、重试（最多 5 次）。
+8. **保存摘要报告** — 将准备结果写入本地 Markdown 文件（`YYYY-mm-dd-HH-MM-SS-{scenario}-prepare-summary.md`），终端仅打印简要摘要。
 
 ## 支持的场景
 
@@ -54,7 +55,7 @@
 ## 输出目录结构
 
 ```
-./{scenario-slug}-{yyyy-mm-dd-HH-MM-SS}/
+./{yyyy-mm-dd-HH-MM-SS}-{scenario-slug}-{target-slug}[-{context-slug}]/
 ├── README.md                          # 实验概览和执行说明
 ├── experiment-template.json           # FIS 实验模板（CLI 创建用）
 ├── iam-policy.json                    # 最小权限 IAM 策略
@@ -63,6 +64,12 @@
     ├── stop-condition-alarms.json     # CloudWatch 告警定义
     └── dashboard.json                 # CloudWatch Dashboard 定义
 ```
+
+可选的 `{context-slug}` 用于区分相同场景和 target 但不同下游服务的实验
+（如 `redis`、`msk`）。适用于网络故障注入 Action（延迟、丢包、端口黑洞）。
+
+场景 slug 使用标准缩写（如 `pod-net-pktloss`、`az-power-int`、`ec-rg-az-power`），
+以确保 IAM Role 名称不超过 64 字符限制。完整缩写表见 SKILL.md 步骤 5。
 
 另外，摘要报告保存为：
 ```
@@ -87,7 +94,7 @@
 
 生成文件后，Skill 立即部署 CloudFormation 模板：
 
-1. **权限预检** — 检查调用者 IAM 策略中 CreateStack/UpdateStack/DeleteStack 是否有 `cloudformation:RoleArn` 条件。如有，提取 CFN 服务角色 ARN 并在后续所有 CFN 命令中自动添加 `--role-arn`。
+1. **权限预检** — 检查调用者 IAM 策略中 CreateStack/UpdateStack/DeleteStack 是否有 `cloudformation:RoleArn` 条件。如有，提取 CFN 服务角色 ARN 并在后续所有 CFN 命令中自动添加 `--role-arn`。如未找到条件，使用 IAM 策略模拟（`simulate-principal-policy`）验证调用者是否有 CloudFormation 权限 — 权限不足时提前终止并提供指导。
 2. **验证** — `aws cloudformation validate-template`
 3. **部署** — `aws cloudformation deploy --capabilities CAPABILITY_NAMED_IAM`（如需要则带 `--role-arn`）
 4. **失败时** — 从 Stack 事件提取错误、分析根因、修复模板、删除失败 Stack、重试
@@ -99,6 +106,16 @@
 - **AWS CLI** (`aws`) — 资源发现、FIS Action 验证、CFN 部署。需要 FIS、IAM、CloudWatch、CloudFormation 权限。
 - [**aws-knowledge-mcp-server**](https://github.com/awslabs/mcp/tree/main/src/aws-knowledge-mcp-server) — Scenario Library 文档研究（`aws___search_documentation`、`aws___read_documentation`）
 - **jq** — JSON 处理（可选但推荐）
+
+**EKS Pod 故障注入前置条件：**
+- EKS 集群认证模式必须为 **`API_AND_CONFIG_MAP`** 或 **`API`**
+  - 检查：`aws eks describe-cluster --name {CLUSTER} --query 'cluster.accessConfig.authenticationMode'`
+  - 如果模式为 `CONFIG_MAP`，用户需先更新集群到 `API_AND_CONFIG_MAP`
+- K8s RBAC 资源（ServiceAccount、Role、RoleBinding）通过 Lambda-backed CFN Custom Resource **自动管理** — 无需手动 `kubectl apply`
+- CFN 模板包含一个 Lambda 函数，幂等创建 K8s RBAC 资源（先检查是否已存在，存在则跳过）。Lambda 使用 `botocore.signers.RequestSigner` 并携带 `x-k8s-aws-id` header 生成 EKS token — 这是 EKS API server 认证所必需的（普通的 `sts_client.generate_presigned_url` 缺少此 header，会导致 401 Unauthorized）。`ensure_resource` 辅助函数包含日志记录和错误检查，防止静默失败。
+- RBAC 资源使用**固定标准化名称**（`fis-sa`、`fis-experiment-role`、`fis-experiment-role-binding`），同一 namespace 下所有 FIS 实验共享
+- 删除 Stack 时**不会删除** RBAC 资源 — 它们是共享的，可能被其他实验使用
+- **强制要求：** 使用任何 `aws:eks:pod-*` Action 时，必须遵循 `references/eks-pod-action-prerequisites.md`
 
 ### 创建 CloudFormation 服务角色
 
@@ -128,6 +145,9 @@ aws cloudformation deploy \
          ├── Scenario Library → 必须先读取 AWS 文档（JSON 模板无法通过 API 获取）
          └── 自定义 FIS Action → 通过 `aws fis get-action` 查询
          ↓
+步骤 2.5: EKS Pod 前置条件（如适用）
+         └── CFN 模板自动包含 Lambda + Custom Resource 管理 K8s RBAC
+         ↓
 步骤 3: 验证资源-Action 兼容性 [关键门控]
          ├── 兼容 → 继续
          └── 不兼容 → 建议替代方案 → 用户确认或中止
@@ -139,6 +159,7 @@ aws cloudformation deploy \
 步骤 5.5: CFN 权限预检（检测 cloudformation:RoleArn 条件）
          ↓
 步骤 6: 部署 CFN 模板并自动修复（最多 5 次重试）
+         ├── ExperimentName 包含随机后缀 → 所有物理资源名全局唯一
          ├── 成功 → 用真实 ARN 更新本地文件
          └── 失败 → 报告错误和所有尝试过的修复
          ↓
@@ -171,6 +192,8 @@ aws cloudformation deploy \
 
 7. **报告保存到文件。** 准备摘要写入带时间戳前缀的本地 Markdown 文件，终端输出保持简洁。
 
+8. **EKS RBAC 通过 CFN Custom Resource 管理。** EKS Pod Action 所需的 K8s RBAC 资源（ServiceAccount、Role、RoleBinding）由 Lambda-backed CFN Custom Resource 自动管理。使用固定标准化名称（`fis-sa`、`fis-experiment-role`、`fis-experiment-role-binding`），同一 namespace 下所有实验共享。Lambda 执行幂等创建（已存在则跳过），删除 Stack 时不会删除 RBAC 资源，因为其他实验可能仍在使用。Lambda 使用 `botocore.signers.RequestSigner` 并携带 `x-k8s-aws-id` header 生成 EKS bearer token，这是 EKS API server 正确认证所必需的。
+
 ## 目录结构
 
 ```
@@ -180,7 +203,8 @@ aws-fis-experiment-prepare/
 ├── README_CN.md                          # 本文件（中文版）
 └── references/
     ├── output-structure.md               # 6 个输出文件的格式规范
-    └── scenario-templates.md             # FIS Scenario Library JSON 模板示例
+    ├── scenario-templates.md             # FIS Scenario Library JSON 模板示例
+    └── eks-pod-action-prerequisites.md   # EKS Pod Action 前置条件（Lambda + Custom Resource 管理 K8s RBAC）
 ```
 
 ## 已知限制

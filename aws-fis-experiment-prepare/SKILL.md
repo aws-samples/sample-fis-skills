@@ -42,6 +42,9 @@ Required tools:
 - EKS cluster authentication mode must be **`API_AND_CONFIG_MAP`** or **`API`**
   - Check with: `aws eks describe-cluster --name {CLUSTER} --query 'cluster.accessConfig.authenticationMode'`
   - If mode is `CONFIG_MAP` only, the user must update the cluster to `API_AND_CONFIG_MAP` first
+- K8s RBAC resources (`fis-sa`, `fis-experiment-role`, `fis-experiment-role-binding`) are automatically
+  managed via Lambda-backed CFN Custom Resource — idempotent creation, shared across experiments, not
+  deleted on stack removal
 - The CFN template will use `AWS::EKS::AccessEntry` to grant FIS the required Kubernetes RBAC permissions
 - **MANDATORY:** When using any `aws:eks:pod-*` action, you MUST follow `references/eks-pod-action-prerequisites.md`
 
@@ -176,18 +179,73 @@ BEFORE proceeding to Step 3.**
 1. Read the official documentation: call `aws___read_documentation` with
    `https://docs.aws.amazon.com/fis/latest/userguide/eks-pod-actions.html`
 2. Follow ALL prerequisites in `references/eks-pod-action-prerequisites.md`:
-   - Verify/create Kubernetes ServiceAccount + RBAC (Role, RoleBinding)
-   - Configure EKS Access Entry with `Username: fis-experiment`
+   - Include Lambda Function, Lambda Execution Role, Lambda EKS Access Entry,
+     and Custom Resource in the `cfn-template.yaml` for automatic K8s RBAC management
+   - Configure EKS Access Entry for FIS Experiment Role with `Username: fis-experiment`
    - Verify cluster authentication mode is `API_AND_CONFIG_MAP` or `API`
    - Check target Pod's `readOnlyRootFilesystem` is `false`
    - For network actions: verify NOT using Fargate or bridge network mode
 
-**Output:** Provide the user with the K8S RBAC YAML manifest to apply before running
-the experiment. Include this in the generated README.md.
+**Output:** K8S RBAC resources are managed automatically via CFN Custom Resource
+(Lambda). No manual `kubectl apply` is required. The `cfn-template.yaml` must include
+the Lambda function, Lambda Execution Role, EKS Access Entry for Lambda, and Custom
+Resource as described in `references/eks-pod-action-prerequisites.md`.
+
+RBAC resources use **fixed standardized names** (`fis-sa`, `fis-experiment-role`,
+`fis-experiment-role-binding`) shared across all FIS experiments in the same namespace.
+The Lambda performs idempotent creation (checks if resources exist before creating)
+and does NOT delete RBAC resources on stack deletion. The FIS experiment template
+uses the fixed ServiceAccount name `fis-sa`.
 
 **Do NOT skip this step.** EKS pod actions have complex prerequisites that differ
 significantly from other FIS actions. Proceeding without these prerequisites will
 cause the experiment to fail at runtime.
+
+#### Pod Memory Stress: Threshold Calculation
+
+**When the action is `aws:eks:pod-memory-stress`, you MUST explain to the user and
+calculate the correct `percent` parameter value.**
+
+The `percent` parameter in `aws:eks:pod-memory-stress` represents **additional memory
+to consume on top of existing usage**, NOT the total memory utilization target. However,
+users typically think in terms of "I want the pod's total memory to reach X%".
+
+**Workflow:**
+
+1. **Ask the user** for their desired total memory utilization target (e.g., "80%").
+   Inform the user: "The percentage you specify is the **total Pod memory threshold**
+   you want to reach, not the additional memory to inject."
+
+2. **Query current memory usage** of the target pod(s):
+   ```bash
+   kubectl top pods -n {NAMESPACE} -l {POD_LABEL_SELECTOR}
+   ```
+   Compare with the pod's memory limit (from `kubectl get pod -o jsonpath` or
+   `kubectl describe pod`) to calculate current utilization percentage.
+
+3. **Calculate the injection value:**
+   ```
+   injection_percent = target_percent - current_usage_percent
+   ```
+   Example: User wants 80% total, current usage is 30% → injection value = 50%
+
+4. **Validate:**
+   - If `injection_percent <= 0`, warn the user: current usage already meets or
+     exceeds the target — no injection needed.
+   - If `injection_percent > 100`, this is invalid — ask the user to verify the target.
+
+5. **Set the parameter** in the experiment template:
+   ```json
+   "parameters": {
+     "duration": "PT5M",
+     "percent": "{injection_percent}"
+   }
+   ```
+
+6. **Include in README.md** the calculation details so the user understands:
+   - Target total memory: X%
+   - Current pod memory usage: Y%
+   - Injected memory stress: X% - Y% = Z%
 
 ### Step 3: Validate Resource-Action Compatibility
 
@@ -332,14 +390,95 @@ Only include sections for services actually affected by the experiment.
 
 Create the output directory:
 ```bash
-SCENARIO_SLUG=$(echo "SCENARIO_NAME" | tr '[:upper:]' '[:lower:]' | tr ' :' '-' | tr -d ',')
-# TARGET_SLUG: primary target resource identifier, e.g., cluster name, instance ID, replication group ID
-# Truncate to keep directory name reasonable (max 40 chars for target slug)
-TARGET_SLUG=$(echo "TARGET_RESOURCE_ID" | tr '[:upper:]' '[:lower:]' | tr ' :/' '-' | cut -c1-40)
+# SCENARIO_SLUG: use the abbreviation table below (max 18 chars)
+SCENARIO_SLUG="<abbreviated-scenario-name>"
+# TARGET_SLUG: primary target resource identifier, e.g., cluster name, instance ID
+# Truncate to keep names within IAM 64-char limit (max 20 chars for target slug)
+TARGET_SLUG=$(echo "TARGET_RESOURCE_ID" | tr '[:upper:]' '[:lower:]' | tr ' :/' '-' | cut -c1-20)
+# CONTEXT_SLUG (optional, max 10 chars): downstream service or purpose that distinguishes
+# experiments with the same scenario + target. Derive from user description or action params:
+#   - Network actions (latency/packet-loss/blackhole-port): target downstream service
+#     e.g., "redis", "msk", "dynamo", "rds" (inferred from port, endpoint, or user description)
+#   - Other actions: omit unless user specifies a distinguishing purpose
+CONTEXT_SLUG=$(echo "CONTEXT_NAME" | tr '[:upper:]' '[:lower:]' | tr ' :/' '-' | cut -c1-10)
 TIMESTAMP=$(date +%Y-%m-%d-%H-%M-%S)
-OUTPUT_DIR="./${TIMESTAMP}-${SCENARIO_SLUG}-${TARGET_SLUG}"
+# Include CONTEXT_SLUG only when it is set (non-empty)
+if [ -n "${CONTEXT_SLUG}" ]; then
+  OUTPUT_DIR="./${TIMESTAMP}-${SCENARIO_SLUG}-${TARGET_SLUG}-${CONTEXT_SLUG}"
+else
+  OUTPUT_DIR="./${TIMESTAMP}-${SCENARIO_SLUG}-${TARGET_SLUG}"
+fi
 mkdir -p "${OUTPUT_DIR}/alarms"
 ```
+
+#### Scenario Slug Abbreviation Table
+
+**Use these standard abbreviations for SCENARIO_SLUG.** Keeps resource names short
+while remaining readable. Max 18 characters.
+
+| Scenario / Action | SCENARIO_SLUG | Len |
+|---|---|---|
+| AZ Power Interruption | `az-power-int` | 13 |
+| AZ Application Slowdown | `az-app-slow` | 11 |
+| Cross-AZ Traffic Slowdown | `xaz-traffic-slow` | 17 |
+| Cross-Region Connectivity | `xregion-conn` | 12 |
+| `aws:eks:pod-network-latency` | `pod-net-latency` | 15 |
+| `aws:eks:pod-network-packet-loss` | `pod-net-pktloss` | 15 |
+| `aws:eks:pod-network-blackhole-port` | `pod-net-blackhole` | 17 |
+| `aws:eks:pod-delete` | `pod-delete` | 10 |
+| `aws:eks:pod-cpu-stress` | `pod-cpu-stress` | 14 |
+| `aws:eks:pod-memory-stress` | `pod-mem-stress` | 14 |
+| `aws:eks:pod-io-stress` | `pod-io-stress` | 13 |
+| `aws:ec2:stop-instances` | `ec2-stop` | 8 |
+| EC2 CPU stress | `ec2-cpu-stress` | 14 |
+| `aws:rds:failover-db-cluster` | `rds-failover` | 12 |
+| `aws:rds:reboot-db-instances` | `rds-reboot` | 10 |
+| `aws:elasticache:replicationgroup-interrupt-az-power` | `ec-rg-az-power` | 14 |
+| `aws:ebs:pause-io` | `ebs-pause-io` | 12 |
+| `aws:ssm:send-command` | `ssm-cmd` | 7 |
+
+**Abbreviation rules for unlisted actions:**
+- `network` → `net`, `packet-loss` → `pktloss`, `memory` → `mem`
+- `cross-az` → `xaz`, `cross-region` → `xregion`
+- `interruption` → `int`, `slowdown` → `slow`, `connectivity` → `conn`
+- `application` → `app`, `replicationgroup` → `rg`, `elasticache` → `ec`
+- EKS pod actions: keep `pod-` prefix, drop `eks-` (e.g., `pod-net-pktloss` not `eks-net-pktloss`)
+- Target max 18 characters
+
+**CONTEXT_SLUG guidance:**
+
+| Action Type | CONTEXT_SLUG Source | Example |
+|---|---|---|
+| `aws:eks:pod-network-latency` | Downstream service name (from port/endpoint/user description) | `redis`, `msk`, `rds` |
+| `aws:eks:pod-network-packet-loss` | Same as above | `redis`, `dynamodb` |
+| `aws:eks:pod-network-blackhole-port` | Same as above | `kafka`, `elasticache` |
+| `aws:eks:pod-delete` | Omit (no directional context) | *(empty)* |
+| `aws:eks:pod-cpu-stress` | Omit | *(empty)* |
+| `aws:eks:pod-memory-stress` | Omit | *(empty)* |
+| Non-EKS actions | Omit unless user specifies a distinguishing purpose | *(empty)* |
+
+When the user describes the experiment, extract the downstream service context. For
+example: "payment pod 到 redis 的丢包" → `CONTEXT_SLUG=redis`;
+"payment pod 到 msk 的网络延迟" → `CONTEXT_SLUG=msk`.
+
+#### Read CFN Resource Documentation Before Generating
+
+**REQUIRED:** Before generating `cfn-template.yaml`, read the `AWS::FIS::ExperimentTemplate`
+CloudFormation resource documentation to ensure the template uses the current property
+schema (Actions, Targets, StopConditions, LogConfiguration, ExperimentOptions, etc.).
+
+```
+aws___read_documentation:
+  url: https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-resource-fis-experimenttemplate.html
+```
+
+Review the required/optional properties and their types. Pay special attention to:
+- `Actions` — each action's `ActionId`, `Parameters`, `Targets`, `StartAfter`
+- `Targets` — `ResourceType`, `SelectionMode`, `ResourceArns` vs `ResourceTags` vs `Filters`
+- `StopConditions` — `Source` (`none` vs `aws:cloudwatch:alarm`), `Value`
+- `ExperimentOptions` — `AccountTargeting`, `EmptyTargetResolutionMode`
+
+Use the documented property names and structures verbatim when generating the CFN template.
 
 Generate files following the templates in `references/output-structure.md`:
 
@@ -469,7 +608,26 @@ Also check attached managed policies via `list-attached-role-policies` +
    ${CFN_ROLE_ARN:+--role-arn ${CFN_ROLE_ARN}}
    ```
 
-**If no condition is found:** leave `CFN_ROLE_ARN` unset, proceed without `--role-arn`.
+**If no condition is found:** verify the caller actually has CloudFormation permissions
+before proceeding. Use IAM policy simulation:
+
+```bash
+CALLER_ARN=$(aws sts get-caller-identity --query 'Arn' --output text)
+
+aws iam simulate-principal-policy \
+  --policy-source-arn "${CALLER_ARN}" \
+  --action-names cloudformation:CreateStack cloudformation:UpdateStack cloudformation:DeleteStack \
+  --query 'EvaluationResults[].{Action:EvalActionName, Decision:EvalDecision}' \
+  --output table
+```
+
+| Simulation Result | Action |
+|---|---|
+| All actions return `allowed` | Leave `CFN_ROLE_ARN` unset, proceed without `--role-arn` |
+| Any action returns `implicitDeny` or `explicitDeny` | **Stop and inform the user.** They need either: (1) a CFN service role (see setup guide below), or (2) broader IAM permissions for CloudFormation. Do NOT attempt deployment — it will fail. |
+
+> **Setup guide for CFN service role:**
+> https://panlm.github.io/others/cfn-service-role-for-fis-experiment-setup-guide/
 
 ### Step 6: Deploy CFN Template (Self-Healing Loop)
 
@@ -494,15 +652,24 @@ Do NOT proceed to deployment until validation passes.
 
 #### 6b. Deploy the Stack
 
-**IMPORTANT:** Use the SAME timestamp for both output directory and stack name to ensure
-consistency. Extract the timestamp from the output directory name rather than generating
-a new one.
+**IMPORTANT:** The `EXPERIMENT_NAME` variable (which includes the random suffix) drives
+both the CFN stack name and all physical resource names within the stack. Generate the
+`RANDOM_SUFFIX` once and reuse it consistently across the stack name and the
+`ExperimentName` CFN parameter.
 
 ```bash
-# Generate a short random suffix (6 chars) to keep the stack name unique but short
-# CFN stack name limit: 128 chars; keep it well under that
+# Generate a short random suffix (6 chars) to keep names unique
+# CFN stack name limit: 128 chars; IAM role name limit: 64 chars
 RANDOM_SUFFIX=$(LC_ALL=C tr -dc 'a-z0-9' < /dev/urandom | head -c6)
-STACK_NAME="fis-${SCENARIO_SLUG}-${TARGET_SLUG}-${RANDOM_SUFFIX}"
+
+# EXPERIMENT_NAME drives all CFN physical resource names — must include RANDOM_SUFFIX
+# to guarantee uniqueness across multiple experiments with same scenario + target
+if [ -n "${CONTEXT_SLUG}" ]; then
+  EXPERIMENT_NAME="${SCENARIO_SLUG}-${TARGET_SLUG}-${CONTEXT_SLUG}-${RANDOM_SUFFIX}"
+else
+  EXPERIMENT_NAME="${SCENARIO_SLUG}-${TARGET_SLUG}-${RANDOM_SUFFIX}"
+fi
+STACK_NAME="fis-${EXPERIMENT_NAME}"
 
 aws cloudformation deploy \
   --template-file "${OUTPUT_DIR}/cfn-template.yaml" \
@@ -510,12 +677,34 @@ aws cloudformation deploy \
   --capabilities CAPABILITY_NAMED_IAM \
   --region ${TARGET_REGION} \
   --no-fail-on-empty-changeset \
+  --parameter-overrides ExperimentName="${EXPERIMENT_NAME}" \
   ${CFN_ROLE_ARN:+--role-arn ${CFN_ROLE_ARN}}
 ```
 
-**Example mapping:**
-- Output directory: `2026-03-31-14-30-22-az-power-interruption-my-cluster`
-- Stack name: `fis-az-power-interruption-my-cluster-a3x7k2`
+**Example mappings:**
+
+| Experiment | Output Directory | Stack Name |
+|---|---|---|
+| payment pod → redis packet-loss | `2026-04-11-10-30-00-pod-net-pktloss-payment-redis` | `fis-pod-net-pktloss-payment-redis-a3x7k2` |
+| payment pod → msk packet-loss | `2026-04-11-10-30-05-pod-net-pktloss-payment-msk` | `fis-pod-net-pktloss-payment-msk-b8y2m1` |
+| payment pod delete | `2026-04-11-10-30-10-pod-delete-payment` | `fis-pod-delete-payment-c4z9n3` |
+| AZ power interruption | `2026-04-11-10-30-15-az-power-int-my-cluster` | `fis-az-power-int-my-cluster-d5w1p7` |
+
+**CFN physical resource names** derived from `ExperimentName` (all globally unique):
+
+| Resource | Naming Pattern | Example |
+|---|---|---|
+| IAM Role | `FISRole-{ExperimentName}` | `FISRole-pod-net-pktloss-payment-redis-a3x7k2` |
+| Dashboard | `FIS-{ExperimentName}` | `FIS-pod-net-pktloss-payment-redis-a3x7k2` |
+| Alarm | `FIS-Stop-{ExperimentName}` | `FIS-Stop-pod-net-pktloss-payment-redis-a3x7k2` |
+| Lambda Role | *(no RoleName — CFN auto-generates)* | `fis-{stack-name-hash-12chars}` |
+| Lambda Func | `fis-rbac-mgr-{StackName}` | *(uses StackName, already unique)* |
+
+**Name length budget (IAM Role = 64 chars max):**
+`FISRole-` (8) + SCENARIO_SLUG (max 18) + `-` + TARGET_SLUG (max 20) + `-` + CONTEXT_SLUG (max 10) + `-` + RANDOM_SUFFIX (6) = 8 + 18 + 1 + 20 + 1 + 10 + 1 + 6 = **65**.
+In practice the slug lengths are well under the max, so this fits comfortably.
+If a generated name would exceed 64 chars, truncate `TARGET_SLUG` first, then
+`CONTEXT_SLUG`.
 
 #### 6c. Self-Healing Iteration Loop
 
@@ -728,3 +917,7 @@ After saving the file, print a brief summary to the terminal listing only:
 - **Keep local files in sync.** After successful deployment, update local files
   (experiment-template.json, README.md) with real ARNs and stack outputs so the
   directory is a complete, accurate record of the deployed experiment.
+- **Pod memory stress requires threshold calculation.** For `aws:eks:pod-memory-stress`,
+  the user's percentage is the **total Pod memory target**, not the injection value.
+  You MUST query current pod memory usage and subtract it from the target to get the
+  correct `percent` parameter. See Step 2.5 "Pod Memory Stress: Threshold Calculation".

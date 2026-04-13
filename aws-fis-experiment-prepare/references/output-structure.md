@@ -6,7 +6,7 @@ All placeholders use `{CURLY_BRACES}` notation.
 ## Directory Layout
 
 ```
-./{yyyy-mm-dd-HH-MM-SS}-{scenario-slug}-{target-slug}/
+./{yyyy-mm-dd-HH-MM-SS}-{scenario-slug}-{target-slug}[-{context-slug}]/
 ├── README.md
 ├── experiment-template.json
 ├── iam-policy.json
@@ -17,22 +17,30 @@ All placeholders use `{CURLY_BRACES}` notation.
 ```
 
 **Naming convention for scenario-slug:**
-- Lowercase, hyphens only
-- Examples: `az-power-interruption`, `az-application-slowdown`, `rds-failover`,
-  `ec2-cpu-stress`, `cross-az-traffic-slowdown`
+- Use the abbreviation table in SKILL.md Step 5
+- Lowercase, hyphens only, max 18 characters
+- Examples: `az-power-int`, `az-app-slow`, `rds-failover`,
+  `ec2-cpu-stress`, `xaz-traffic-slow`, `pod-net-pktloss`
 
 **Naming convention for target-slug:**
 - Primary target resource identifier (cluster name, instance ID, replication group ID, etc.)
-- Lowercase, hyphens only, truncated to max 40 characters
+- Lowercase, hyphens only, truncated to max 20 characters
 - Examples: `my-aurora-cluster`, `prod-redis-rg`, `i-0abc123def`
 - For AZ-level scenarios with multiple targets, use the most representative resource
+
+**Naming convention for context-slug (optional):**
+- Downstream service or purpose that distinguishes experiments with the same scenario + target
+- Lowercase, hyphens only, truncated to max 10 characters
+- Used for network fault injection actions (latency, packet-loss, blackhole-port) to
+  identify the target downstream service (e.g., `redis`, `msk`, `dynamo`)
+- Omit for non-directional actions (pod-delete, cpu-stress, memory-stress, etc.)
 
 ---
 
 ## README.md
 
 **Key placeholders to replace after CFN deployment:**
-- `{STACK_NAME}` — The actual deployed CloudFormation stack name (e.g., `fis-az-power-interruption-my-cluster-a3x7k2`)
+- `{STACK_NAME}` — The actual deployed CloudFormation stack name (e.g., `fis-az-power-int-my-cluster-a3x7k2`)
 - `{TEMPLATE_ID}` — The FIS experiment template ID from stack outputs
 - `{DASHBOARD_URL}` — The CloudWatch dashboard URL from stack outputs
 
@@ -232,7 +240,11 @@ Description: 'FIS Experiment: {Scenario Name} - {TARGET_RESOURCE_ID} - {REGION}'
 Parameters:
   ExperimentName:
     Type: String
-    Default: '{SCENARIO_NAME}-{TARGET_SLUG}'
+    Default: '{SCENARIO_SLUG}-{TARGET_SLUG}[-{CONTEXT_SLUG}]-{RANDOM_SUFFIX}'
+    Description: >-
+      Unique experiment identifier. Includes random suffix to prevent
+      resource name collisions across multiple experiments with the same
+      scenario and target. Passed via --parameter-overrides at deploy time.
   TargetAZ:
     Type: String
     Default: '{AZ_ID}'
@@ -365,7 +377,7 @@ Resources:
   # StopConditionAlarm:
   #   Type: AWS::CloudWatch::Alarm
   #   Properties:
-  #     AlarmName: !Sub 'FIS-StopCondition-${ExperimentName}'
+  #     AlarmName: !Sub 'FIS-Stop-${ExperimentName}'
   #     AlarmDescription: 'Stop FIS experiment if critical threshold breached'
   #     Namespace: '{METRIC_NAMESPACE}'
   #     MetricName: '{METRIC_NAME}'
@@ -424,7 +436,7 @@ Array of CloudWatch alarm definitions for CLI creation:
 ```json
 [
     {
-        "AlarmName": "FIS-StopCondition-{SCENARIO}-{SERVICE}",
+        "AlarmName": "FIS-Stop-{EXPERIMENT_NAME}-{SERVICE}",
         "AlarmDescription": "Stop FIS experiment if {CONDITION}",
         "Namespace": "{NAMESPACE}",
         "MetricName": "{METRIC}",

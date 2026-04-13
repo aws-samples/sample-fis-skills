@@ -20,38 +20,54 @@ Running an AWS FIS experiment after preparation still involves manual verificati
 2. **Reads README.md** to extract the CFN stack name and experiment metadata.
 3. **Verifies stack deployment** — checks that the CloudFormation stack is in `CREATE_COMPLETE` or `UPDATE_COMPLETE` status.
 4. **Extracts template ID** from stack outputs.
-5. **Enforces safety** — presents a clear impact warning with affected resources, requires explicit user confirmation before starting.
-6. **Starts the experiment** only after explicit user confirmation.
-7. **Monitors progress** — polls experiment status every 30-60 seconds, records timestamps for each status change and per-service events, reminds user to check the dashboard.
-8. **Saves results report** — writes the experiment results to a local markdown file (`YYYY-mm-dd-HH-MM-SS-{scenario}-experiment-results.md`) with **per-service impact analysis** where each service has its own timeline, observations, and key findings — so readers can see the full picture for each service without jumping between sections. Prints a brief summary to the terminal.
+5. **Classifies experiment type and determines log collection** — reads `experiment-template.json` to extract all action IDs, classifies as POD or NON-POD experiment, and displays the classification to the user. Auto-enables log collection for pod experiments (`aws:eks:pod-*` actions). For non-pod experiments, asks the user (default: No). Handles Scenario Library templates with opaque actions via fallback logic.
+6. **Discovers EKS apps and starts log collection** — (**only if log collection enabled**) loads `eks-app-log-analysis` skill to discover EKS apps and start background `kubectl logs -f` **before the experiment starts** to avoid missing early log entries.
+7. **Enforces safety** — presents a clear impact warning with affected resources, experiment type, and (if log collection enabled) monitored applications, requires explicit user confirmation before starting.
+8. **Starts the experiment** only after explicit user confirmation.
+9. **Monitors progress** — polls experiment status every 30-60 seconds, records timestamps for each status change and per-service events. If log collection is enabled, also displays per-app error counts and recovery signals.
+10. **Stops log collection and analyzes** — (**only if log collection enabled**) follows `eks-app-log-analysis` Steps 7-8 to kill background processes, analyze error patterns, peak rates, and recovery times.
+11. **Saves results report** — writes the experiment results to a local markdown file with **per-service impact analysis** and (if log collection enabled) **application log analysis**. Prints a brief summary to the terminal.
 
 **Note:** This skill does **NOT** deploy infrastructure. It only verifies that the stack is already deployed and proceeds with experiment execution.
 
 ## Workflow Overview
 
 ```
-Step 1: Load experiment directory + validate required files
-         ↓
-Step 2: Read README.md → extract CFN stack name + metadata
-         ↓
-Step 3: Check CloudFormation stack status
-         ├── CREATE_COMPLETE or UPDATE_COMPLETE → proceed
-         └── Not ready / failed / not found → abort with guidance
-         ↓
-Step 4: Extract experiment template ID from stack outputs
-         ↓
-Step 5: Start experiment [CRITICAL — requires explicit user confirmation]
-         ├── Display impact warning (resources, duration, stop conditions)
-         ├── User confirms → start experiment
-         └── User declines → skip to results report
-         ↓
-Step 6: Monitor experiment
-         ├── Poll status every 30s (first 5 min) then 60s
-         ├── Show current status after each poll
-         ├── Record timestamps for each status change and action transition
-         └── Remind user: check dashboard
-         ↓
-Step 7: Save results report to local file (YYYY-mm-dd-HH-MM-SS-{scenario}-experiment-results.md)
+Step 1:  Load experiment directory + validate required files
+          ↓
+Step 2:  Read README.md → extract CFN stack name + metadata
+          ↓
+Step 3:  Check CloudFormation stack status
+          ├── CREATE_COMPLETE or UPDATE_COMPLETE → proceed
+          └── Not ready / failed / not found → abort with guidance
+          ↓
+Step 4:  Extract experiment template ID from stack outputs
+          ↓
+Step 5:  Classify experiment type + determine log collection
+          ├── Read experiment-template.json, extract actionIds, display to user
+          ├── Auto-Yes: pod experiments (any aws:eks:pod-* action)
+          ├── Non-pod: MUST ask user (default: No → skip to Step 7)
+          └── Yes → proceed to Step 6
+          ↓ (if Yes)
+Step 6:  Discover EKS apps + start log collection [BEFORE experiment]
+          ├── Load eks-app-log-analysis skill (real-time mode) Steps 3-4
+          ├── Default: start collecting immediately
+          └── Optional (user opt-in): collect 2 min baseline first
+          ↓
+Step 7:  Start experiment [CRITICAL — requires explicit user confirmation]
+          ├── Display impact warning (resources, experiment type, duration, stop conditions)
+          ├── User confirms → start experiment
+          └── User declines → abort (cleanup logs if collected)
+          ↓
+Step 8:  Monitor experiment (+ log insights if collecting)
+          ├── Poll status every 30s (first 5 min) then 60s
+          ├── Record timestamps for each status change and action transition
+          ├── If collecting: show per-app error/warning counts
+          └── Remind user: check dashboard
+          ↓ (if collecting)
+Step 9:  Stop log collection + analyze (via eks-app-log-analysis Steps 7-8)
+          ↓
+Step 10: Save results report to local file (YYYY-mm-dd-HH-MM-SS-{scenario}-experiment-results.md)
 ```
 
 ## Safety Rules
@@ -106,8 +122,14 @@ The report includes:
   - **Key timeline** — only the events relevant to that specific service (timestamps in UTC time-only format), so readers can correlate with CloudWatch Dashboard metrics without leaving the section
   - **Observations** — observed behavior during and after the experiment
   - **Key findings** — what happened, why, and recovery behavior
+- **Application log analysis** — for each monitored EKS application:
+  - Error timeline with timestamps and messages
+  - Key error patterns with counts and first/last occurrence
+  - Critical error log samples (5-10 lines)
+  - Insights correlating app errors with infrastructure events
 - Recovery status summary table
 - Issues requiring attention (with remediation commands)
+- Raw log file locations (appendix)
 - Cleanup instructions
 
 A brief summary is printed to the terminal, including per-service recovery status.
@@ -130,6 +152,7 @@ The experiment directory must contain:
 ## Prerequisites
 
 - **AWS CLI** (`aws`) — FIS, CloudWatch, CloudFormation operations. Must have permissions for all services.
+- **kubectl** — configured with access to target EKS cluster (**only required if** app log collection is enabled).
 - **Prepared experiment directory** — Configuration source, from aws-fis-experiment-prepare or manually created.
 
 ## Key CLI Commands
@@ -215,11 +238,19 @@ aws cloudwatch delete-dashboards --dashboard-names "FIS-{SCENARIO}" --region {RE
 
 3. **Explicit confirmation is non-negotiable.** FIS experiments cause real impact. The skill never auto-starts — it always presents a warning with specific resource details and requires the user to type confirmation.
 
-4. **Continuous monitoring with reminders.** During the experiment, the skill polls status and reminds the user to check the CloudWatch dashboard. Operators should not rely solely on terminal output during fault injection.
+4. **Experiment classification is explicit.** Before deciding on log collection, the skill reads `experiment-template.json`, extracts all action IDs, classifies the experiment as POD or NON-POD, and displays the classification with action IDs to the user. This transparency ensures the user can verify the classification before proceeding. Scenario Library templates with opaque actions are handled via fallback logic based on scenario name and README description.
 
-5. **Results saved to file.** The experiment results report is written to a timestamped local markdown file, keeping terminal output concise while preserving a full record.
+5. **App discovery before experiment start.** When log collection is enabled, EKS application dependencies are discovered and log collection is started BEFORE the experiment begins. This prevents missing early log entries that may be rotated or overwritten during the experiment.
 
-6. **Cleanup is offered, not forced.** After the experiment, cleanup commands are suggested but never executed without confirmation.
+6. **Log collection is opt-in (auto-enabled for pod experiments).** For `aws:eks:pod-*` actions, log collection is automatically enabled — pod experiments inherently need application log analysis. For all other experiments, the skill explicitly asks the user (default No) and waits for a response. This is a mandatory interaction point — the agent cannot decide on behalf of the user. Infra teams get a fast path without kubectl; app teams and pod experiments get full log analysis via `eks-app-log-analysis`. The skill can also be used independently for post-hoc analysis.
+
+7. **Baseline logs are opt-in.** By default, log collection starts immediately and stops when the experiment ends. Pre-experiment (2 min) and post-experiment (2 min) baseline collection is only activated when the user explicitly requests it, keeping the default flow fast.
+
+8. **Continuous monitoring with log insights.** During the experiment, each poll cycle shows both experiment status and per-app error/warning counts from collected logs, giving operators a real-time view of application impact alongside infrastructure status.
+
+9. **Results saved to file.** The experiment results report is written to a timestamped local markdown file, keeping terminal output concise while preserving a full record.
+
+10. **Cleanup is offered, not forced.** After the experiment, cleanup commands are suggested but never executed without confirmation.
 
 ## Directory Structure
 
@@ -235,12 +266,15 @@ aws-fis-experiment-execute/
 ## Limitations
 
 - Requires AWS CLI with permissions for FIS, CloudWatch, and CloudFormation.
+- Requires kubectl configured for the target EKS cluster (for log collection).
 - **Does not deploy infrastructure** — expects the stack to be already deployed.
 - Monitoring relies on CLI polling; real-time dashboard requires the user to open the CloudWatch console.
-- The skill does not handle multi-step recovery verification — it reminds the user to check, but cannot verify application-level health automatically.
+- Application log collection uses `kubectl logs -f` which only captures logs from running pods. Logs from pods terminated during the experiment may be lost unless Container Insights is enabled.
+- Auto-discovery of application dependencies relies on endpoint references in pod env vars and ConfigMaps — applications using service discovery or DNS-based resolution may not be detected automatically.
 
 ## Related Skills
 
 - [aws-fis-experiment-prepare](../aws-fis-experiment-prepare/) — Generate and deploy experiment configuration (run before this skill)
 - [aws-service-chaos-research](../aws-service-chaos-research/) — Research chaos testing scenarios for any AWS service
+- [eks-app-log-analysis](../eks-app-log-analysis/) — Standalone post-hoc application log analysis (this skill now integrates real-time log analysis directly)
 - [eks-workload-best-practice-assessment](../eks-workload-best-practice-assessment/) — Assess EKS workload configurations

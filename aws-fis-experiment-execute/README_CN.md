@@ -20,38 +20,54 @@
 2. **读取 README.md** 提取 CFN Stack 名称和实验元数据。
 3. **验证 Stack 部署** — 检查 CloudFormation Stack 是否处于 `CREATE_COMPLETE` 或 `UPDATE_COMPLETE` 状态。
 4. **提取模板 ID** — 从 Stack 输出中获取。
-5. **强制安全确认** — 展示清晰的影响警告（受影响资源列表），要求用户明确确认后才启动。
-6. **启动实验** — 仅在用户明确确认后执行。
-7. **监控进度** — 每 30-60 秒轮询实验状态，记录每次状态变更和各服务事件的时间戳，提醒用户查看 Dashboard。
-8. **保存结果报告** — 将实验结果写入本地 Markdown 文件（`YYYY-mm-dd-HH-MM-SS-{scenario}-experiment-results.md`），采用**按服务拆分的影响分析**结构，每个服务有独立的时间线、观察结果和关键发现 — 读者无需在章节间来回跳转即可看到每个服务的完整分析。终端仅打印简要摘要。
+5. **分类实验类型并判断是否收集日志** — 读取 `experiment-template.json` 提取所有 action ID，分类为 POD 或 NON-POD 实验，并向用户展示分类结果和 action 列表。针对 pod 实验（`aws:eks:pod-*` actions）自动启用日志收集。非 pod 实验必须询问用户（默认为否），这是强制交互点 — agent 不能替用户做决定。处理 Scenario Library 模板中的不透明 action 使用回退逻辑。
+6. **发现 EKS 应用并启动日志收集** — （**仅在启用日志收集时**）加载 `eks-app-log-analysis` skill，在**实验启动前**发现 EKS 应用并启动后台 `kubectl logs -f`，避免遗漏早期日志。
+7. **强制安全确认** — 展示清晰的影响警告（受影响资源、实验类型，启用日志收集时包含监控的应用列表），要求用户明确确认后才启动。
+8. **启动实验** — 仅在用户明确确认后执行。
+9. **监控进度** — 每 30-60 秒轮询实验状态，记录每次状态变更和各服务事件的时间戳。启用日志收集时还显示各应用错误/警告计数和恢复信号。
+10. **停止日志收集并分析** — （**仅在启用日志收集时**）遵循 `eks-app-log-analysis` 步骤 7-8 终止后台进程，分析错误模式、峰值速率和恢复时间。
+11. **保存结果报告** — 将实验结果写入本地 Markdown 文件，包含**按服务拆分的影响分析**，启用日志收集时还包含**应用日志分析**。终端仅打印简要摘要。
 
 **注意：** 本 Skill **不会**部署基础设施。它仅验证 Stack 已部署，然后执行实验。
 
 ## 工作流程概览
 
 ```
-步骤 1: 加载实验目录 + 验证必需文件
-         ↓
-步骤 2: 读取 README.md → 提取 CFN Stack 名称 + 元数据
-         ↓
-步骤 3: 检查 CloudFormation Stack 状态
-         ├── CREATE_COMPLETE 或 UPDATE_COMPLETE → 继续
-         └── 未就绪 / 失败 / 未找到 → 中止并提供指导
-         ↓
-步骤 4: 从 Stack 输出提取实验模板 ID
-         ↓
-步骤 5: 启动实验 [关键 — 需要用户明确确认]
-         ├── 展示影响警告（资源、时长、Stop Condition）
-         ├── 用户确认 → 启动实验
-         └── 用户拒绝 → 跳至结果报告
-         ↓
-步骤 6: 监控实验
-         ├── 前 5 分钟每 30 秒轮询，之后每 60 秒
-         ├── 每次轮询后显示当前状态
-         ├── 记录每次状态变更和 Action 转换的时间戳
-         └── 提醒用户：查看 Dashboard
-         ↓
-步骤 7: 保存结果报告到本地文件 (YYYY-mm-dd-HH-MM-SS-{scenario}-experiment-results.md)
+步骤 1:  加载实验目录 + 验证必需文件
+          ↓
+步骤 2:  读取 README.md → 提取 CFN Stack 名称 + 元数据
+          ↓
+步骤 3:  检查 CloudFormation Stack 状态
+          ├── CREATE_COMPLETE 或 UPDATE_COMPLETE → 继续
+          └── 未就绪 / 失败 / 未找到 → 中止并提供指导
+          ↓
+步骤 4:  从 Stack 输出提取实验模板 ID
+          ↓
+步骤 5:  分类实验类型 + 判断是否收集日志
+          ├── 读取 experiment-template.json，提取 actionId，展示给用户
+          ├── 自动启用：pod 实验（任何 aws:eks:pod-* action）
+          ├── 非 pod：必须询问用户（默认：否 → 跳至步骤 7）
+          └── 是 → 继续步骤 6
+          ↓ (如选是)
+步骤 6:  发现 EKS 应用 + 启动日志收集 [实验启动前完成]
+          ├── 加载 eks-app-log-analysis skill（实时模式）步骤 3-4
+          ├── 默认：立即开始收集
+          └── 可选（用户选择）：先收集 2 分钟基线日志
+          ↓
+步骤 7:  启动实验 [关键 — 需要用户明确确认]
+          ├── 展示影响警告（资源、实验类型、时长、Stop Condition）
+          ├── 用户确认 → 启动实验
+          └── 用户拒绝 → 中止（如有日志收集则先清理）
+          ↓
+步骤 8:  监控实验（启用日志收集时含日志洞察）
+          ├── 前 5 分钟每 30 秒轮询，之后每 60 秒
+          ├── 记录每次状态变更和 Action 转换的时间戳
+          ├── 如收集日志：显示各应用错误/警告计数
+          └── 提醒用户：查看 Dashboard
+          ↓ (如收集日志)
+步骤 9:  停止日志收集 + 分析（通过 eks-app-log-analysis 步骤 7-8）
+          ↓
+步骤 10: 保存结果报告到本地文件 (YYYY-mm-dd-HH-MM-SS-{scenario}-experiment-results.md)
 ```
 
 ## 安全规则
@@ -105,8 +121,14 @@ YYYY-mm-dd-HH-MM-SS-{scenario}-experiment-results.md
   - **关键时间线** — 仅列出与该服务相关的事件（时间戳使用 UTC 时间格式），方便直接对照 CloudWatch Dashboard 指标，无需离开当前章节
   - **观察结果** — 实验期间和实验后的观察行为
   - **关键发现** — 发生了什么、为什么、恢复行为如何
+- **应用日志分析** — 针对每个监控的 EKS 应用：
+  - 错误时间线（含时间戳和消息）
+  - 关键错误模式（计数、首次和末次出现时间）
+  - 关键错误日志样本（5-10 行）
+  - 将应用错误与基础设施事件关联的洞察
 - 恢复状态总结表
 - 需要关注的问题（含修复命令）
+- 原始日志文件位置（附录）
 - 清理说明
 
 终端打印简要摘要，包含各服务恢复状态。
@@ -129,6 +151,7 @@ YYYY-mm-dd-HH-MM-SS-{scenario}-experiment-results.md
 ## 前置条件
 
 - **AWS CLI** (`aws`) — FIS、CloudWatch、CloudFormation 操作。需要相关服务的权限。
+- **kubectl** — 已配置目标 EKS 集群访问权限（**仅在启用**应用日志收集时需要）。
 - **已准备好的实验目录** — 配置来源，来自 aws-fis-experiment-prepare 或手动创建。
 
 ## 关键 CLI 命令
@@ -214,11 +237,19 @@ aws cloudwatch delete-dashboards --dashboard-names "FIS-{SCENARIO}" --region {RE
 
 3. **明确确认不可妥协。** FIS 实验产生真实影响。Skill 绝不自动启动 — 始终展示具体资源细节的警告，要求用户输入确认。
 
-4. **持续监控加提醒。** 实验期间，Skill 轮询状态并提醒用户查看 CloudWatch Dashboard。故障注入期间不应仅依赖终端输出。
+4. **实验分类透明化。** 在决定日志收集前，skill 读取 `experiment-template.json`，提取所有 action ID，分类为 POD 或 NON-POD 实验，并向用户展示分类结果和 action ID 列表。这种透明性确保用户在继续前可以验证分类是否正确。Scenario Library 模板中的不透明 action 通过基于场景名和 README 描述的回退逻辑处理。
 
-5. **结果保存到文件。** 实验结果报告写入带时间戳的本地 Markdown 文件，终端输出保持简洁，同时保留完整记录。
+5. **应用发现在实验启动前完成。** 选择收集日志时，EKS 应用依赖在实验开始前发现，日志收集也在实验前启动。这防止实验开始后才找应用，导致早期日志被轮转或覆盖而丢失。
 
-6. **清理建议但不强制。** 实验结束后提供清理命令，但绝不在未确认的情况下执行。
+6. **日志收集可选（pod 实验自动启用）。** 针对 `aws:eks:pod-*` actions，日志收集自动启用 — pod 实验本质上需要应用日志分析。所有其他实验必须明确询问用户（默认否）并等待回复，这是强制交互点 — agent 不能替用户做决定。infra 团队无需 kubectl 即可快速执行；应用团队和 pod 实验通过 `eks-app-log-analysis` 获得完整日志分析。该 skill 也可独立用于事后分析。
+
+7. **基线日志可选。** 默认情况下，日志收集在实验启动时开始，实验结束时停止。实验前（2 分钟）和实验后（2 分钟）基线收集仅在用户明确要求时激活，保持默认流程简洁高效。
+
+8. **监控中包含日志洞察。** 实验期间，每次轮询同时展示实验状态和各应用错误/警告计数，让操作者实时了解应用受影响情况。
+
+9. **结果保存到文件。** 实验结果报告写入带时间戳的本地 Markdown 文件，终端输出保持简洁，同时保留完整记录。
+
+10. **清理建议但不强制。** 实验结束后提供清理命令，但绝不在未确认的情况下执行。
 
 ## 目录结构
 
@@ -234,12 +265,15 @@ aws-fis-experiment-execute/
 ## 已知限制
 
 - 需要 AWS CLI 并具有 FIS、CloudWatch、CloudFormation 权限。
+- 需要 kubectl 已配置目标 EKS 集群访问权限（用于日志收集）。
 - **不部署基础设施** — 期望 Stack 已部署。
 - 监控依赖 CLI 轮询；实时 Dashboard 需要用户打开 CloudWatch 控制台。
-- Skill 不处理多步恢复验证 — 会提醒用户检查，但无法自动验证应用层健康。
+- 应用日志收集使用 `kubectl logs -f`，仅能捕获运行中 Pod 的日志。实验期间被终止的 Pod 的日志可能丢失，除非启用了 Container Insights。
+- 应用依赖自动发现依赖 Pod 环境变量和 ConfigMap 中的端点引用 — 使用服务发现或 DNS 解析的应用可能无法自动检测。
 
 ## 相关 Skill
 
 - [aws-fis-experiment-prepare](../aws-fis-experiment-prepare/) — 生成并部署实验配置（本 Skill 之前运行）
 - [aws-service-chaos-research](../aws-service-chaos-research/) — 为任意 AWS 服务研究混沌测试场景
+- [eks-app-log-analysis](../eks-app-log-analysis/) — 独立的事后应用日志分析（本 Skill 现已集成实时日志分析）
 - [eks-workload-best-practice-assessment](../eks-workload-best-practice-assessment/) — 评估 EKS 工作负载配置

@@ -25,9 +25,10 @@ Preparing an AWS FIS experiment manually involves several error-prone, tedious s
 3. **Discovers target resources** — Queries the user's actual AWS resources and collects target identifiers.
 3. **Validates compatibility** — Inspects actual resources via AWS CLI (e.g., `describe-db-instances`, `describe-db-clusters`) and cross-checks against FIS action `resourceType` requirements before generating any files.
 4. **Determines monitoring configuration** — Defaults to `source: "none"` (no stop condition alarm). Only creates CloudWatch alarms if the user explicitly provides one. Generates a comprehensive CloudWatch dashboard with per-service availability, performance, and error/latency metrics.
-5. **Generates configuration files** — Produces a self-contained directory with 6 files: experiment template, IAM policy, CFN template, alarms, dashboard, and README.
-6. **Deploys with self-healing** — Deploys the CFN template, and if deployment fails, automatically analyzes errors, fixes the template, deletes the failed stack, and retries (up to 5 times).
-7. **Saves summary report** — Writes preparation results to a local markdown file (`YYYY-mm-dd-HH-MM-SS-{scenario}-prepare-summary.md`) and prints a brief summary to the terminal.
+5. **Reads CFN resource documentation** — Before generating the CFN template, reads the `AWS::FIS::ExperimentTemplate` CloudFormation documentation to ensure the template uses the current property schema.
+6. **Generates configuration files** — Produces a self-contained directory with 6 files: experiment template, IAM policy, CFN template, alarms, dashboard, and README.
+7. **Deploys with self-healing** — Deploys the CFN template, and if deployment fails, automatically analyzes errors, fixes the template, deletes the failed stack, and retries (up to 5 times).
+8. **Saves summary report** — Writes preparation results to a local markdown file (`YYYY-mm-dd-HH-MM-SS-{scenario}-prepare-summary.md`) and prints a brief summary to the terminal.
 
 ## Supported Scenarios
 
@@ -54,7 +55,7 @@ Any valid FIS action ID, e.g.:
 ## Output Directory Structure
 
 ```
-./{scenario-slug}-{yyyy-mm-dd-HH-MM-SS}/
+./{yyyy-mm-dd-HH-MM-SS}-{scenario-slug}-{target-slug}[-{context-slug}]/
 ├── README.md                          # Experiment overview and execution instructions
 ├── experiment-template.json           # FIS experiment template for CLI creation
 ├── iam-policy.json                    # Least-privilege IAM permissions
@@ -63,6 +64,14 @@ Any valid FIS action ID, e.g.:
     ├── stop-condition-alarms.json     # CloudWatch alarm definitions
     └── dashboard.json                 # CloudWatch dashboard body
 ```
+
+The optional `{context-slug}` distinguishes experiments with the same scenario and target
+but different downstream services (e.g., `redis`, `msk`). Used for network fault injection
+actions (latency, packet-loss, blackhole-port).
+
+Scenario slugs use standard abbreviations (e.g., `pod-net-pktloss`, `az-power-int`,
+`ec-rg-az-power`) to stay within IAM Role 64-char name limits. See SKILL.md Step 5
+for the full abbreviation table.
 
 Additionally, a summary report is saved as:
 ```
@@ -87,7 +96,7 @@ When incompatible, the skill explains the mismatch and suggests alternatives.
 
 After generating files, the skill immediately deploys the CloudFormation template:
 
-1. **Permission pre-check** — Inspects the caller's IAM policy for a `cloudformation:RoleArn` condition on CreateStack/UpdateStack/DeleteStack. If found, extracts the required CFN Service Role ARN and adds `--role-arn` to all subsequent CFN commands.
+1. **Permission pre-check** — Inspects the caller's IAM policy for a `cloudformation:RoleArn` condition on CreateStack/UpdateStack/DeleteStack. If found, extracts the required CFN Service Role ARN and adds `--role-arn` to all subsequent CFN commands. If no condition is found, uses IAM policy simulation (`simulate-principal-policy`) to verify the caller has CloudFormation permissions — stops early with guidance if permissions are missing.
 2. **Validate** — `aws cloudformation validate-template`
 3. **Deploy** — `aws cloudformation deploy --capabilities CAPABILITY_NAMED_IAM` (with `--role-arn` if required)
 4. **On failure** — Extract error from stack events, analyze root cause, fix template, delete failed stack, retry
@@ -99,6 +108,16 @@ After generating files, the skill immediately deploys the CloudFormation templat
 - **AWS CLI** (`aws`) — Resource discovery, FIS action validation, CFN deployment. Must have permissions for FIS, IAM, CloudWatch, CloudFormation.
 - [**aws-knowledge-mcp-server**](https://github.com/awslabs/mcp/tree/main/src/aws-knowledge-mcp-server) — Scenario Library documentation research (`aws___search_documentation`, `aws___read_documentation`)
 - **jq** — JSON processing (optional but recommended)
+
+**EKS Pod fault injection prerequisites:**
+- EKS cluster authentication mode must be **`API_AND_CONFIG_MAP`** or **`API`**
+  - Check with: `aws eks describe-cluster --name {CLUSTER} --query 'cluster.accessConfig.authenticationMode'`
+  - If mode is `CONFIG_MAP` only, the user must update the cluster to `API_AND_CONFIG_MAP` first
+- K8s RBAC resources (ServiceAccount, Role, RoleBinding) are **automatically managed** via a Lambda-backed CFN Custom Resource — no manual `kubectl apply` is required
+- The CFN template includes a Lambda function that performs idempotent creation of K8s RBAC resources (checks if they exist before creating). The Lambda uses `botocore.signers.RequestSigner` with `x-k8s-aws-id` header for EKS token generation — this is required for EKS API server authentication (plain `sts_client.generate_presigned_url` lacks this header and results in 401 Unauthorized). The `ensure_resource` helper includes logging and error checking to prevent silent failures.
+- RBAC resources use **fixed standardized names** (`fis-sa`, `fis-experiment-role`, `fis-experiment-role-binding`) shared across all FIS experiments in the same namespace
+- RBAC resources are **not deleted** when a stack is removed — they are shared and may be used by other experiments
+- **MANDATORY:** When using any `aws:eks:pod-*` action, you MUST follow `references/eks-pod-action-prerequisites.md`
 
 ### Create a CloudFormation Service Role
 
@@ -128,6 +147,9 @@ Step 2: Discover target resources
          ├── Scenario Library → MUST read AWS documentation first (JSON templates not available via API)
          └── Custom FIS action → query via `aws fis get-action`
          ↓
+Step 2.5: EKS Pod prerequisites (if applicable)
+         └── CFN template auto-includes Lambda + Custom Resource for K8s RBAC management
+         ↓
 Step 3: Validate resource-action compatibility [CRITICAL GATE]
          ├── Compatible → proceed
          └── Incompatible → suggest alternative → user confirms or abort
@@ -139,6 +161,7 @@ Step 5: Generate 6 configuration files in output directory
 Step 5.5: CFN permission pre-check (detect cloudformation:RoleArn condition)
          ↓
 Step 6: Deploy CFN template with self-healing loop (up to 5 retries)
+         ├── ExperimentName includes random suffix → all physical resource names globally unique
          ├── On success → update local files with real ARNs
          └── On failure → report error with all attempted fixes
          ↓
@@ -171,6 +194,10 @@ Step 7: Save summary report to local file (YYYY-mm-dd-HH-MM-SS-{scenario}-prepar
 
 7. **Report saved to file.** The preparation summary is written to a local markdown file with timestamp prefix, keeping the terminal output concise.
 
+8. **EKS RBAC via CFN Custom Resource.** K8s RBAC resources (ServiceAccount, Role, RoleBinding) for EKS Pod actions are managed automatically by a Lambda-backed CFN Custom Resource. Uses fixed standardized names (`fis-sa`, `fis-experiment-role`, `fis-experiment-role-binding`) shared across all experiments in the same namespace. Lambda performs idempotent creation (skip if exists) and does NOT delete RBAC on stack removal, since other experiments may still depend on them. The Lambda uses `botocore.signers.RequestSigner` with `x-k8s-aws-id` header for EKS bearer token generation, which is required for proper EKS API server authentication.
+
+9. **Naming convention prevents collisions.** `ExperimentName` includes a 6-character random suffix, making all CFN physical resource names (IAM Role, Dashboard, Alarm) globally unique. An optional `context-slug` in directory and resource names distinguishes experiments with the same scenario and target but different downstream services (e.g., `payment-redis` vs `payment-msk` for network fault injection).
+
 ## Directory Structure
 
 ```
@@ -180,7 +207,8 @@ aws-fis-experiment-prepare/
 ├── README_CN.md                          # Chinese version
 └── references/
     ├── output-structure.md               # File format specifications for all 6 output files
-    └── scenario-templates.md             # FIS Scenario Library JSON template examples
+    ├── scenario-templates.md             # FIS Scenario Library JSON template examples
+    └── eks-pod-action-prerequisites.md   # EKS Pod action prerequisites (Lambda + Custom Resource for K8s RBAC)
 ```
 
 ## Limitations
