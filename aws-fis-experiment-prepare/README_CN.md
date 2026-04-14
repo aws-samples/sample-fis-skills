@@ -28,7 +28,7 @@
 5. **读取 CFN 资源文档** — 在生成 CFN 模板之前，读取 `AWS::FIS::ExperimentTemplate` CloudFormation 文档，确保模板使用当前的属性 schema。
 6. **生成配置文件** — 生成包含 6 个文件的自包含目录：实验模板、IAM 策略、CFN 模板、告警、Dashboard 和 README。
 7. **自动修复部署** — 部署 CFN 模板，若部署失败则自动分析错误、修复模板、删除失败 Stack、重试（最多 5 次）。
-8. **保存摘要报告** — 将准备结果写入本地 Markdown 文件（`YYYY-mm-dd-HH-MM-SS-{scenario}-prepare-summary.md`），终端仅打印简要摘要。
+8. **目录重命名追加模版 ID** — 部署成功后，将实验模版 ID 追加到输出目录名（如 `2026-04-11-pod-net-pktloss-payment-redis-EXT1a2b3c4d5e6f7/`），方便用户查找。
 
 ## 支持的场景
 
@@ -55,7 +55,7 @@
 ## 输出目录结构
 
 ```
-./{yyyy-mm-dd-HH-MM-SS}-{scenario-slug}-{target-slug}[-{context-slug}]/
+./{yyyy-mm-dd-HH-MM-SS}-{scenario-slug}-{target-slug}[-{context-slug}]-{TEMPLATE_ID}/
 ├── README.md                          # 实验概览和执行说明
 ├── experiment-template.json           # FIS 实验模板（CLI 创建用）
 ├── iam-policy.json                    # 最小权限 IAM 策略
@@ -68,13 +68,10 @@
 可选的 `{context-slug}` 用于区分相同场景和 target 但不同下游服务的实验
 （如 `redis`、`msk`）。适用于网络故障注入 Action（延迟、丢包、端口黑洞）。
 
-场景 slug 使用标准缩写（如 `pod-net-pktloss`、`az-power-int`、`ec-rg-az-power`），
-以确保 IAM Role 名称不超过 64 字符限制。完整缩写表见 SKILL.md 步骤 5。
+`{TEMPLATE_ID}` 是 FIS 实验模版 ID（如 `EXT1a2b3c4d5e6f7`），在 CFN 部署成功后追加到目录名，方便用户查找。
 
-另外，摘要报告保存为：
-```
-./YYYY-mm-dd-HH-MM-SS-{scenario}-prepare-summary.md
-```
+场景 slug 使用标准缩写（如 `pod-net-pktloss`、`az-power-int`、`ec-rg-az-power`），
+以确保 CFN Stack 名称和资源名称简洁可读。完整缩写表见 SKILL.md 步骤 5。
 
 ## 资源-Action 兼容性验证
 
@@ -163,7 +160,7 @@ aws cloudformation deploy \
          ├── 成功 → 用真实 ARN 更新本地文件
          └── 失败 → 报告错误和所有尝试过的修复
          ↓
-步骤 7: 保存摘要报告到本地文件 (YYYY-mm-dd-HH-MM-SS-{scenario}-prepare-summary.md)
+步骤 7: 重命名输出目录（追加实验模版 ID，方便用户查找）
 ```
 
 ## 使用示例
@@ -190,7 +187,7 @@ aws cloudformation deploy \
 
 6. **绝不启动实验。** 本 Skill 只准备和部署基础设施。启动实际实验由 [aws-fis-experiment-execute](../aws-fis-experiment-execute/) 或用户手动完成。
 
-7. **报告保存到文件。** 准备摘要写入带时间戳前缀的本地 Markdown 文件，终端输出保持简洁。
+7. **目录名包含实验模版 ID。** 部署成功后，输出目录名自动追加实验模版 ID（如 `EXT1a2b3c4d5e6f7`），用户可以直接通过目录名识别对应的实验模版。
 
 8. **EKS RBAC 通过 CFN Custom Resource 管理。** EKS Pod Action 所需的 K8s RBAC 资源（ServiceAccount、Role、RoleBinding）由 Lambda-backed CFN Custom Resource 自动管理。使用固定标准化名称（`fis-sa`、`fis-experiment-role`、`fis-experiment-role-binding`），同一 namespace 下所有实验共享。Lambda 执行幂等创建（已存在则跳过），删除 Stack 时不会删除 RBAC 资源，因为其他实验可能仍在使用。Lambda 使用 `botocore.signers.RequestSigner` 并携带 `x-k8s-aws-id` header 生成 EKS bearer token，这是 EKS API server 正确认证所必需的。
 

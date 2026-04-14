@@ -16,7 +16,7 @@
 
 ## 核心功能
 
-1. **加载并验证** 已准备好的实验目录（来自 [aws-fis-experiment-prepare](../aws-fis-experiment-prepare/) 或手动创建）。
+1. **加载并验证** 已准备好的实验目录（来自 [aws-fis-experiment-prepare](../aws-fis-experiment-prepare/) 或手动创建）。支持**通过实验模板 ID 自动查找目录** — 如果用户提供模板 ID（如 `EXT1a2b3c4d5e6f7`），skill 会在当前目录下搜索匹配的实验目录。
 2. **读取 README.md** 提取 CFN Stack 名称和实验元数据。
 3. **验证 Stack 部署** — 检查 CloudFormation Stack 是否处于 `CREATE_COMPLETE` 或 `UPDATE_COMPLETE` 状态。
 4. **提取模板 ID** — 从 Stack 输出中获取。
@@ -26,14 +26,20 @@
 8. **启动实验** — 仅在用户明确确认后执行。
 9. **监控进度** — 每 30-60 秒轮询实验状态，记录每次状态变更和各服务事件的时间戳。启用日志收集时还显示各应用错误/警告计数和恢复信号。
 10. **停止日志收集并分析** — （**仅在启用日志收集时**）遵循 `eks-app-log-analysis` 步骤 7-8 终止后台进程，分析错误模式、峰值速率和恢复时间。
-11. **保存结果报告** — 将实验结果写入本地 Markdown 文件，包含**按服务拆分的影响分析**，启用日志收集时还包含**应用日志分析**。终端仅打印简要摘要。
+11. **保存结果报告** — 将实验结果写入**实验目录**中的 Markdown 文件，包含**按服务拆分的影响分析**，启用日志收集时还包含**应用日志分析**。终端仅打印简要摘要。
 
 **注意：** 本 Skill **不会**部署基础设施。它仅验证 Stack 已部署，然后执行实验。
 
 ## 工作流程概览
 
 ```
-步骤 1:  加载实验目录 + 验证必需文件
+步骤 1:  解析实验目录（从路径或模板 ID）
+          ├── 提供完整路径 → 直接验证
+          ├── 提供模板 ID → 在当前目录搜索以 *-{ID} 结尾的目录
+          │   ├── 找到 1 个匹配 → 使用该目录
+          │   ├── 找到多个匹配 → 让用户选择
+          │   └── 未找到匹配 → 让用户提供完整路径
+          └── 验证必需文件
           ↓
 步骤 2:  读取 README.md → 提取 CFN Stack 名称 + 元数据
           ↓
@@ -67,7 +73,7 @@
           ↓ (如收集日志)
 步骤 9:  停止日志收集 + 分析（通过 eks-app-log-analysis 步骤 7-8）
           ↓
-步骤 10: 保存结果报告到本地文件 (YYYY-mm-dd-HH-MM-SS-{scenario}-experiment-results.md)
+步骤 10: 保存结果报告到实验目录 (YYYY-mm-dd-HH-MM-SS-{scenario}-experiment-results.md)
 ```
 
 ## 安全规则
@@ -222,34 +228,38 @@ aws cloudwatch delete-dashboards --dashboard-names "FIS-{SCENARIO}" --region {RE
 ## 使用示例
 
 ```
-"Execute the FIS experiment in ./2025-03-27-10-30-00-az-power-interruption-my-cluster/"
+"Execute the FIS experiment in ./2025-03-27-10-30-00-az-power-interruption-my-cluster-EXT1a2b3c4d5e6f7/"
 "Run the chaos experiment I just prepared"
 "启动 FIS 实验"
 "检查 Stack 是否已部署并运行实验"
-"运行混沌实验，目录在 ./2025-03-27-rds-failover-prod-db/"
+"运行混沌实验，目录在 ./2025-03-27-rds-failover-prod-db-EXTa1b2c3d4e5f6g/"
+"执行实验 EXT1a2b3c4d5e6f7"
+"run experiment EXTabc123def456"
 ```
 
 ## 关键设计决策
 
 1. **不部署 — 仅验证。** 本 Skill 假设 CloudFormation Stack 已部署（由 `aws-fis-experiment-prepare` 或手动部署）。它在执行前验证 Stack 状态。
 
-2. **从 README 获取 Stack 名称。** Stack 名称从实验目录的 README.md 中的 `**CFN Stack:**` 字段提取，确保与 prepare skill 的输出一致。
+2. **通过模板 ID 自动查找目录。** 当用户仅提供模板 ID（如 `EXT1a2b3c4d5e6f7`）时，skill 在当前工作目录搜索以该 ID 结尾的目录。这支持用户记住 prepare 阶段的模板 ID 但不记得完整目录名的常见场景。未找到匹配时，提示用户输入完整路径。
 
-3. **明确确认不可妥协。** FIS 实验产生真实影响。Skill 绝不自动启动 — 始终展示具体资源细节的警告，要求用户输入确认。
+3. **从 README 获取 Stack 名称。** Stack 名称从实验目录的 README.md 中的 `**CFN Stack:**` 字段提取，确保与 prepare skill 的输出一致。
 
-4. **实验分类透明化。** 在决定日志收集前，skill 读取 `experiment-template.json`，提取所有 action ID，分类为 POD 或 NON-POD 实验，并向用户展示分类结果和 action ID 列表。这种透明性确保用户在继续前可以验证分类是否正确。Scenario Library 模板中的不透明 action 通过基于场景名和 README 描述的回退逻辑处理。
+4. **明确确认不可妥协。** FIS 实验产生真实影响。Skill 绝不自动启动 — 始终展示具体资源细节的警告，要求用户输入确认。
 
-5. **应用发现在实验启动前完成。** 选择收集日志时，EKS 应用依赖在实验开始前发现，日志收集也在实验前启动。这防止实验开始后才找应用，导致早期日志被轮转或覆盖而丢失。
+5. **实验分类透明化。** 在决定日志收集前，skill 读取 `experiment-template.json`，提取所有 action ID，分类为 POD 或 NON-POD 实验，并向用户展示分类结果和 action ID 列表。这种透明性确保用户在继续前可以验证分类是否正确。Scenario Library 模板中的不透明 action 通过基于场景名和 README 描述的回退逻辑处理。
 
-6. **日志收集可选（pod 实验自动启用）。** 针对 `aws:eks:pod-*` actions，日志收集自动启用 — pod 实验本质上需要应用日志分析。所有其他实验必须明确询问用户（默认否）并等待回复，这是强制交互点 — agent 不能替用户做决定。infra 团队无需 kubectl 即可快速执行；应用团队和 pod 实验通过 `eks-app-log-analysis` 获得完整日志分析。该 skill 也可独立用于事后分析。
+6. **应用发现在实验启动前完成。** 选择收集日志时，EKS 应用依赖在实验开始前发现，日志收集也在实验前启动。这防止实验开始后才找应用，导致早期日志被轮转或覆盖而丢失。
 
-7. **基线日志可选。** 默认情况下，日志收集在实验启动时开始，实验结束时停止。实验前（2 分钟）和实验后（2 分钟）基线收集仅在用户明确要求时激活，保持默认流程简洁高效。
+7. **日志收集可选（pod 实验自动启用）。** 针对 `aws:eks:pod-*` actions，日志收集自动启用 — pod 实验本质上需要应用日志分析。所有其他实验必须明确询问用户（默认否）并等待回复，这是强制交互点 — agent 不能替用户做决定。infra 团队无需 kubectl 即可快速执行；应用团队和 pod 实验通过 `eks-app-log-analysis` 获得完整日志分析。该 skill 也可独立用于事后分析。
 
-8. **监控中包含日志洞察。** 实验期间，每次轮询同时展示实验状态和各应用错误/警告计数，让操作者实时了解应用受影响情况。
+8. **基线日志可选。** 默认情况下，日志收集在实验启动时开始，实验结束时停止。实验前（2 分钟）和实验后（2 分钟）基线收集仅在用户明确要求时激活，保持默认流程简洁高效。
 
-9. **结果保存到文件。** 实验结果报告写入带时间戳的本地 Markdown 文件，终端输出保持简洁，同时保留完整记录。
+9. **监控中包含日志洞察。** 实验期间，每次轮询同时展示实验状态和各应用错误/警告计数，让操作者实时了解应用受影响情况。
 
-10. **清理建议但不强制。** 实验结束后提供清理命令，但绝不在未确认的情况下执行。
+10. **结果保存到文件。** 实验结果报告写入带时间戳的本地 Markdown 文件，终端输出保持简洁，同时保留完整记录。
+
+11. **清理建议但不强制。** 实验结束后提供清理命令，但绝不在未确认的情况下执行。
 
 ## 目录结构
 

@@ -17,7 +17,7 @@ During BCP (Business Continuity Plan) drills with AWS FIS:
 
 1. **Dual-mode operation** — Real-time monitoring during experiments OR post-hoc analysis after experiments
 2. **Smart dependency discovery** — Reads experiment context and guides user to specify app-to-service dependencies
-3. **Parallel log collection** — Background `kubectl logs -f` processes for multiple applications simultaneously
+3. **Parallel log collection** — Background `kubectl logs -f` processes for multiple applications simultaneously, collecting only regular containers (excluding FIS-injected ephemeral containers)
 4. **Live insight display** — Every 30 seconds: actual error logs (5 lines) + analysis insights per service group
 5. **Comprehensive analysis report** — Error timelines, patterns, cross-service correlation, recovery analysis
 
@@ -87,13 +87,14 @@ The generated report includes:
 
 ```
 {experiment-dir}/
-├── {timestamp}-app-logs/          # Timestamped for multiple runs
-│   ├── {service-1}/
-│   │   ├── {app-1}.log
-│   │   └── {app-2}.log
-│   └── {service-2}/
-│       └── {app-3}.log
-└── {timestamp}-app-log-analysis.md
+├── {timestamp}-app-log-analysis.md    # Analysis report (saved to experiment directory)
+│
+/tmp/{timestamp}-fis-app-logs/         # Temp directory for raw logs
+├── {service-1}/
+│   ├── {app-1}.log
+│   └── {app-2}.log
+└── {service-2}/
+    └── {app-3}.log
 ```
 
 ## Usage Examples
@@ -128,5 +129,6 @@ eks-app-log-analysis/
 
 - Requires kubectl access to EKS cluster; logs not in cluster are not captured
 - Pod restarts during experiment may cause log gaps (kubectl logs only shows current pod)
+- FIS pod-level fault injection uses ephemeral containers — the skill explicitly excludes these to avoid noise in application logs
 - For long-running experiments, consider using CloudWatch Logs Insights instead
 - Real-time mode requires experiment to be running; if experiment completed, use post-hoc mode

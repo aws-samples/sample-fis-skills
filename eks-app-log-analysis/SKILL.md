@@ -111,14 +111,29 @@ organized by service name subdirectories.
 
 #### Real-time Mode: Background Collection
 
-For each application in `SERVICE_APP_MAP`, start a background `kubectl logs -f` process:
+For each application in `SERVICE_APP_MAP`, start background `kubectl logs -f` processes
+for **regular containers only** (excluding FIS-injected ephemeral containers):
 
 1. Resolve the deployment's pod label selector from `.spec.selector.matchLabels`
-2. Use `kubectl logs -f --selector={labels}` (NOT `deployment/xxx`) — this captures
-   logs from all matching pods, including those recreated during the experiment
-3. Add `--timestamps --all-containers=true --prefix=true --max-log-requests=20`
-4. Append output to `{LOG_DIR}/{service-name}/{deployment}.log`
-5. Record each background PID to `{LOG_DIR}/.pids` for cleanup
+2. Get the list of **regular container names** from the deployment spec:
+   ```bash
+   kubectl get deployment {DEPLOYMENT} -n {NAMESPACE} \
+     -o jsonpath='{.spec.template.spec.containers[*].name}'
+   ```
+   Do NOT use `--all-containers=true` — FIS pod-level fault injection (e.g.,
+   `pod-network-latency`, `pod-cpu-stress`) injects ephemeral containers into target
+   pods. Using `--all-containers` would pull in FIS agent logs (noise) alongside
+   application logs. Always use `--container={name}` to collect only regular containers.
+3. For **each** regular container, start a background log stream:
+   ```bash
+   kubectl logs -f --selector={labels} -n {NAMESPACE} \
+     --container={CONTAINER_NAME} --timestamps --prefix=true \
+     --max-log-requests=20 \
+     >> {LOG_DIR}/{service-name}/{deployment}.log &
+   ```
+   Use `--selector={labels}` (NOT `deployment/xxx`) — this captures logs from all
+   matching pods, including those recreated during the experiment.
+4. Record each background PID to `{LOG_DIR}/.pids` for cleanup
 
 #### Post-hoc Mode: Batch Fetch
 
@@ -141,9 +156,11 @@ complete logs including from pods that no longer exist.
 
 **Step 4c: kubectl logs (fallback, no Container Insights)**
 
-Use `kubectl logs --selector={labels} --since-time={START_TIME}` with the same
-flags as real-time mode (without `-f`). Note: this only retrieves logs from
-currently running pods — logs from pods terminated during the experiment are lost.
+Use `kubectl logs --selector={labels} --since-time={START_TIME}` with
+`--container={CONTAINER_NAME} --timestamps --prefix=true` for each regular container
+(same container discovery as real-time mode Step 2). Do NOT use `--all-containers`.
+Note: this only retrieves logs from currently running pods — logs from pods terminated
+during the experiment are lost.
 
 ### Step 5: Real-time Monitoring Display
 
@@ -169,9 +186,8 @@ After experiment completes (or immediately in post-hoc mode), generate the repor
 
 ```bash
 TIMESTAMP=$(date +%Y-%m-%d-%H-%M-%S)
-# Save the report in the current working directory (where the user invoked the skill),
-# NOT in the experiment directory
-REPORT_FILE="./${TIMESTAMP}-app-log-analysis.md"
+# Save the report in the experiment directory (EXPERIMENT_DIR)
+REPORT_FILE="${EXPERIMENT_DIR}/${TIMESTAMP}-app-log-analysis.md"
 ```
 
 Report structure:
@@ -268,10 +284,10 @@ Remove the PID file after cleanup.
 ## Output Files
 
 ```
-./                                            # Current working directory
-└── {timestamp}-app-log-analysis.md           # Analysis report
+{EXPERIMENT_DIR}/                                 # Experiment directory
+└── {timestamp}-app-log-analysis.md               # Analysis report
 
-/tmp/{timestamp}-fis-app-logs/                # Temp directory for raw logs
+/tmp/{timestamp}-fis-app-logs/                    # Temp directory for raw logs
 ├── rds-cluster-xxx/
 │   ├── app-backend.log
 │   └── api-server.log

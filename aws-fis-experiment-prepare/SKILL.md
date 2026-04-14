@@ -533,7 +533,7 @@ add an inline policy with only the specific permissions needed.
 FISExperimentRole:
   Type: AWS::IAM::Role
   Properties:
-    RoleName: !Sub 'FISRole-${ExperimentName}'
+    RoleName: !Sub 'fis-role-${RandomSuffix}'
     AssumeRolePolicyDocument:
       Version: '2012-10-17'
       Statement:
@@ -677,34 +677,48 @@ aws cloudformation deploy \
   --capabilities CAPABILITY_NAMED_IAM \
   --region ${TARGET_REGION} \
   --no-fail-on-empty-changeset \
-  --parameter-overrides ExperimentName="${EXPERIMENT_NAME}" \
+  --parameter-overrides ExperimentName="${EXPERIMENT_NAME}" RandomSuffix="${RANDOM_SUFFIX}" \
   ${CFN_ROLE_ARN:+--role-arn ${CFN_ROLE_ARN}}
 ```
 
 **Example mappings:**
 
-| Experiment | Output Directory | Stack Name |
+| Experiment | Output Directory (initial) | Stack Name |
 |---|---|---|
 | payment pod → redis packet-loss | `2026-04-11-10-30-00-pod-net-pktloss-payment-redis` | `fis-pod-net-pktloss-payment-redis-a3x7k2` |
 | payment pod → msk packet-loss | `2026-04-11-10-30-05-pod-net-pktloss-payment-msk` | `fis-pod-net-pktloss-payment-msk-b8y2m1` |
 | payment pod delete | `2026-04-11-10-30-10-pod-delete-payment` | `fis-pod-delete-payment-c4z9n3` |
 | AZ power interruption | `2026-04-11-10-30-15-az-power-int-my-cluster` | `fis-az-power-int-my-cluster-d5w1p7` |
 
-**CFN physical resource names** derived from `ExperimentName` (all globally unique):
+**Note:** After successful CFN deployment, directories are renamed in Step 7 to append
+the experiment template ID (e.g., `2026-04-11-10-30-00-pod-net-pktloss-payment-redis-EXT1a2b3c4d5e6f7`).
 
-| Resource | Naming Pattern | Example |
-|---|---|---|
-| IAM Role | `FISRole-{ExperimentName}` | `FISRole-pod-net-pktloss-payment-redis-a3x7k2` |
-| Dashboard | `FIS-{ExperimentName}` | `FIS-pod-net-pktloss-payment-redis-a3x7k2` |
-| Alarm | `FIS-Stop-{ExperimentName}` | `FIS-Stop-pod-net-pktloss-payment-redis-a3x7k2` |
-| Lambda Role | *(no RoleName — CFN auto-generates)* | `fis-{stack-name-hash-12chars}` |
-| Lambda Func | `fis-rbac-mgr-{StackName}` | *(uses StackName, already unique)* |
+**CFN physical resource names** — resources with generous name limits (128-256 chars) use
+`ExperimentName` for readability; Lambda-related resources (64-char IAM Role limit) use
+`RandomSuffix` with a fixed prefix for brevity:
 
-**Name length budget (IAM Role = 64 chars max):**
-`FISRole-` (8) + SCENARIO_SLUG (max 18) + `-` + TARGET_SLUG (max 20) + `-` + CONTEXT_SLUG (max 10) + `-` + RANDOM_SUFFIX (6) = 8 + 18 + 1 + 20 + 1 + 10 + 1 + 6 = **65**.
-In practice the slug lengths are well under the max, so this fits comfortably.
-If a generated name would exceed 64 chars, truncate `TARGET_SLUG` first, then
-`CONTEXT_SLUG`.
+| Resource | Naming Pattern | Example | AWS Limit |
+|---|---|---|---|
+| IAM Role | `fis-role-{RandomSuffix}` | `fis-role-a3x7k2` | 64 chars |
+| Dashboard | `fis-{ExperimentName}` | `fis-pod-net-pktloss-payment-redis-a3x7k2` | 256 chars |
+| Alarm | `fis-stop-{ExperimentName}` | `fis-stop-pod-net-pktloss-payment-redis-a3x7k2` | 255 chars |
+| Lambda Role | `fis-lambda-role-{RandomSuffix}` | `fis-lambda-role-a3x7k2` | 64 chars |
+| Lambda Func | `fis-rbac-{RandomSuffix}` | `fis-rbac-a3x7k2` | 64 chars |
+
+**Name length budget:**
+
+| Resource | Pattern | Max Length | AWS Limit | Safe? |
+|---|---|---|---|---|
+| CFN Stack | `fis-` (4) + ExperimentName (max 57) | **61** | 128 | Always safe |
+| IAM Role | `fis-role-` (9) + RandomSuffix (6) | **15** | 64 | Always safe |
+| Dashboard | `fis-` (4) + ExperimentName (max 57) | **61** | 256 | Always safe |
+| Alarm | `fis-stop-` (9) + ExperimentName (max 57) | **66** | 255 | Always safe |
+| Lambda Role | `fis-lambda-role-` (16) + RandomSuffix (6) | **22** | 64 | Always safe |
+| Lambda Func | `fis-rbac-` (9) + RandomSuffix (6) | **15** | 64 | Always safe |
+
+All resources with a 64-char AWS limit (IAM Roles, Lambda Function) use `RandomSuffix`
+only, so they are always safe regardless of slug lengths. Resources with generous limits
+(128-256 chars) use `ExperimentName` for readability.
 
 #### 6c. Self-Healing Iteration Loop
 
@@ -804,71 +818,46 @@ After the stack deploys successfully:
    - The actual stack name (`${STACK_NAME}` — e.g., `fis-az-power-interruption-my-cluster-a3x7k2`)
    - The experiment template ID from stack outputs
    - The CloudWatch dashboard URL from stack outputs
+   - **CFN Deployment Status** section with stack name, deployment status
+     (`CREATE_COMPLETE`), experiment template ID, and dashboard URL
+   - **Next Step** section with the command to start the experiment (both
+     `aws-fis-experiment-execute` skill and manual `aws fis start-experiment` command)
    - **Cleanup command with the EXACT stack name** — do NOT use placeholders like
      `{TIMESTAMP}` in the final README; replace with the actual deployed stack name
 
-### Step 7: Save Summary Report to Local File
+### Step 7: Rename Output Directory with Experiment Template ID
 
-**Write the preparation summary to a local markdown file** instead of only presenting
-it in the terminal. Use the following file naming convention:
+After successful CFN deployment, **rename the output directory to append the experiment
+template ID**. This makes it easy for users to identify which directory corresponds to
+which experiment template.
 
 ```bash
-TIMESTAMP=$(date +%Y-%m-%d-%H-%M-%S)
-# File name: ${TIMESTAMP}-${SCENARIO_SLUG}-prepare-summary.md
-# Save the file in the same parent directory as ${OUTPUT_DIR}
+# Extract the experiment template ID from stack outputs
+TEMPLATE_ID=$(aws cloudformation describe-stacks \
+  --stack-name "${STACK_NAME}" \
+  --query 'Stacks[0].Outputs[?OutputKey==`ExperimentTemplateId`].OutputValue' \
+  --output text --region ${TARGET_REGION})
+
+# Rename directory: append experiment template ID
+NEW_OUTPUT_DIR="${OUTPUT_DIR}-${TEMPLATE_ID}"
+mv "${OUTPUT_DIR}" "${NEW_OUTPUT_DIR}"
+OUTPUT_DIR="${NEW_OUTPUT_DIR}"
 ```
 
-The summary report file must include:
-
-```markdown
-# FIS Experiment Preparation Summary
-
-## Scenario
-- **Name:** {SCENARIO_NAME}
-- **Description:** {SCENARIO_DESCRIPTION}
-
-## Target
-- **Region:** {TARGET_REGION}
-- **Availability Zone:** {TARGET_AZ} (if applicable)
-
-## Affected Resources
-{list each affected resource type, ID, and configuration}
-
-## Experiment Duration
-- **Estimated Duration:** {DURATION}
-
-## Generated Files
-| File | Path | Description |
-|---|---|---|
-| Experiment Template | `{OUTPUT_DIR}/experiment-template.json` | FIS experiment template |
-| IAM Policy | `{OUTPUT_DIR}/iam-policy.json` | Required IAM permissions |
-| CFN Template | `{OUTPUT_DIR}/cfn-template.yaml` | CloudFormation deployment |
-| Stop Condition Alarms | `{OUTPUT_DIR}/alarms/stop-condition-alarms.json` | CloudWatch alarms |
-| Dashboard | `{OUTPUT_DIR}/alarms/dashboard.json` | CloudWatch dashboard |
-| README | `{OUTPUT_DIR}/README.md` | Experiment overview |
-
-## CFN Deployment Status
-- **Stack Name:** {STACK_NAME}
-- **Status:** {DEPLOYMENT_STATUS}
-- **Experiment Template ID:** {TEMPLATE_ID}
-- **CloudWatch Dashboard URL:** {DASHBOARD_URL}
-
-## Next Step
-To start the experiment:
-- Use aws-fis-experiment-execute skill, OR
-- Manually: `aws fis start-experiment --experiment-template-id {TEMPLATE_ID} --region {TARGET_REGION}`
-
-## Cleanup
-To delete all resources after the experiment:
-```bash
-aws cloudformation delete-stack --stack-name {STACK_NAME} --region {TARGET_REGION} ${CFN_ROLE_ARN:+--role-arn ${CFN_ROLE_ARN}}
-aws cloudformation wait stack-delete-complete --stack-name {STACK_NAME} --region {TARGET_REGION}
+**Example:**
 ```
+Before: 2026-04-11-10-30-00-pod-net-pktloss-payment-redis/
+After:  2026-04-11-10-30-00-pod-net-pktloss-payment-redis-EXT1a2b3c4d5e6f7/
 ```
 
-After saving the file, print a brief summary to the terminal listing only:
-- The file path of the saved summary report
-- The experiment output directory path
+**Note:** The template ID is already extracted in Step 6d. Reuse the same value here.
+If the CFN deployment failed (Step 6c exceeded max retries), skip this rename step.
+
+After renaming, **update `README.md`** to set the `**Directory:**` field to the final
+directory name (with template ID), e.g., `2026-04-11-10-30-00-pod-net-pktloss-payment-redis-EXT1a2b3c4d5e6f7`.
+
+After renaming, print a brief summary to the terminal listing only:
+- The experiment output directory path (with template ID)
 - CFN stack name and deployment status
 - Experiment template ID
 - Next step instruction

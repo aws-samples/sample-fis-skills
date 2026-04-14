@@ -28,7 +28,7 @@ Preparing an AWS FIS experiment manually involves several error-prone, tedious s
 5. **Reads CFN resource documentation** — Before generating the CFN template, reads the `AWS::FIS::ExperimentTemplate` CloudFormation documentation to ensure the template uses the current property schema.
 6. **Generates configuration files** — Produces a self-contained directory with 6 files: experiment template, IAM policy, CFN template, alarms, dashboard, and README.
 7. **Deploys with self-healing** — Deploys the CFN template, and if deployment fails, automatically analyzes errors, fixes the template, deletes the failed stack, and retries (up to 5 times).
-8. **Saves summary report** — Writes preparation results to a local markdown file (`YYYY-mm-dd-HH-MM-SS-{scenario}-prepare-summary.md`) and prints a brief summary to the terminal.
+8. **Renames directory with template ID** — After successful deployment, appends the experiment template ID to the output directory name (e.g., `2026-04-11-pod-net-pktloss-payment-redis-EXT1a2b3c4d5e6f7/`) for easy identification.
 
 ## Supported Scenarios
 
@@ -55,7 +55,7 @@ Any valid FIS action ID, e.g.:
 ## Output Directory Structure
 
 ```
-./{yyyy-mm-dd-HH-MM-SS}-{scenario-slug}-{target-slug}[-{context-slug}]/
+./{yyyy-mm-dd-HH-MM-SS}-{scenario-slug}-{target-slug}[-{context-slug}]-{TEMPLATE_ID}/
 ├── README.md                          # Experiment overview and execution instructions
 ├── experiment-template.json           # FIS experiment template for CLI creation
 ├── iam-policy.json                    # Least-privilege IAM permissions
@@ -69,14 +69,12 @@ The optional `{context-slug}` distinguishes experiments with the same scenario a
 but different downstream services (e.g., `redis`, `msk`). Used for network fault injection
 actions (latency, packet-loss, blackhole-port).
 
-Scenario slugs use standard abbreviations (e.g., `pod-net-pktloss`, `az-power-int`,
-`ec-rg-az-power`) to stay within IAM Role 64-char name limits. See SKILL.md Step 5
-for the full abbreviation table.
+The `{TEMPLATE_ID}` is the FIS experiment template ID (e.g., `EXT1a2b3c4d5e6f7`), appended
+after successful CFN deployment for easy identification.
 
-Additionally, a summary report is saved as:
-```
-./YYYY-mm-dd-HH-MM-SS-{scenario}-prepare-summary.md
-```
+Scenario slugs use standard abbreviations (e.g., `pod-net-pktloss`, `az-power-int`,
+`ec-rg-az-power`) to keep CFN stack names and resource names concise. See SKILL.md Step 5
+for the full abbreviation table.
 
 ## Resource-Action Compatibility Validation
 
@@ -165,7 +163,7 @@ Step 6: Deploy CFN template with self-healing loop (up to 5 retries)
          ├── On success → update local files with real ARNs
          └── On failure → report error with all attempted fixes
          ↓
-Step 7: Save summary report to local file (YYYY-mm-dd-HH-MM-SS-{scenario}-prepare-summary.md)
+Step 7: Rename output directory (append experiment template ID for easy identification)
 ```
 
 ## Usage Examples
@@ -192,7 +190,7 @@ Step 7: Save summary report to local file (YYYY-mm-dd-HH-MM-SS-{scenario}-prepar
 
 6. **Never starts the experiment.** This skill only prepares and deploys infrastructure. Starting the actual experiment is handled by [aws-fis-experiment-execute](../aws-fis-experiment-execute/) or manually by the user.
 
-7. **Report saved to file.** The preparation summary is written to a local markdown file with timestamp prefix, keeping the terminal output concise.
+7. **Directory name includes experiment template ID.** After successful deployment, the output directory is renamed to append the experiment template ID (e.g., `EXT1a2b3c4d5e6f7`), making it easy to identify which directory corresponds to which experiment.
 
 8. **EKS RBAC via CFN Custom Resource.** K8s RBAC resources (ServiceAccount, Role, RoleBinding) for EKS Pod actions are managed automatically by a Lambda-backed CFN Custom Resource. Uses fixed standardized names (`fis-sa`, `fis-experiment-role`, `fis-experiment-role-binding`) shared across all experiments in the same namespace. Lambda performs idempotent creation (skip if exists) and does NOT delete RBAC on stack removal, since other experiments may still depend on them. The Lambda uses `botocore.signers.RequestSigner` with `x-k8s-aws-id` header for EKS bearer token generation, which is required for proper EKS API server authentication.
 

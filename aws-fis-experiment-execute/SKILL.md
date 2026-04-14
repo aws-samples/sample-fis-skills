@@ -4,7 +4,8 @@ description: >
   Use when the user wants to run a prepared AWS FIS experiment where the
   CloudFormation stack has already been deployed. Triggers on "execute FIS
   experiment", "run FIS experiment", "start chaos experiment", "启动 FIS 实验",
-  "运行混沌实验", "执行故障注入实验", "run the experiment in [directory]".
+  "运行混沌实验", "执行故障注入实验", "run the experiment in [directory]",
+  or when the user provides an FIS experiment template ID (e.g. EXT1a2b3c4d5e6f7).
   Does NOT deploy infrastructure — only checks that it is already deployed.
 ---
 
@@ -33,7 +34,10 @@ Required tools:
 
 ```dot
 digraph execute_flow {
-    "Load experiment directory" [shape=box];
+    "User input:\npath or template ID?" [shape=diamond];
+    "Search CWD for\nmatching directory" [shape=box];
+    "Directory found?" [shape=diamond];
+    "Ask user for full path" [shape=box, style=bold];
     "Validate files" [shape=box];
     "Read README for stack name" [shape=box];
     "Check CFN stack status" [shape=diamond];
@@ -55,7 +59,12 @@ digraph execute_flow {
     "Stop logs + analyze\n(eks-app-log-analysis)" [shape=box];
     "Generate results report" [shape=box];
 
-    "Load experiment directory" -> "Validate files";
+    "User input:\npath or template ID?" -> "Validate files" [label="Full path"];
+    "User input:\npath or template ID?" -> "Search CWD for\nmatching directory" [label="Template ID"];
+    "Search CWD for\nmatching directory" -> "Directory found?";
+    "Directory found?" -> "Validate files" [label="Yes (1 match)"];
+    "Directory found?" -> "Ask user for full path" [label="No match"];
+    "Ask user for full path" -> "Validate files" [label="User provides path"];
     "Validate files" -> "Read README for stack name";
     "Read README for stack name" -> "Check CFN stack status";
     "Check CFN stack status" -> "Extract template ID from outputs" [label="CREATE_COMPLETE"];
@@ -88,13 +97,56 @@ digraph execute_flow {
 }
 ```
 
-### Step 1: Load and Validate Experiment Directory
+### Step 1: Resolve and Validate Experiment Directory
 
-The user provides the path to the experiment directory. Verify it contains the
-required files:
+The user provides either:
+- **(a)** the full path to the experiment directory, OR
+- **(b)** an FIS experiment template ID (e.g., `EXT1a2b3c4d5e6f7`)
+
+#### Step 1a: Resolve directory from template ID
+
+If the user provides a template ID instead of a directory path, search the
+**current working directory** for a directory whose name ends with that ID:
 
 ```bash
-EXPERIMENT_DIR="{USER_PROVIDED_PATH}"
+TEMPLATE_ID_INPUT="{USER_PROVIDED_TEMPLATE_ID}"
+
+# Search for directories ending with the template ID (case-sensitive)
+MATCHED_DIRS=$(find . -maxdepth 1 -type d -name "*-${TEMPLATE_ID_INPUT}" -o -type d -name "*${TEMPLATE_ID_INPUT}" 2>/dev/null | head -5)
+```
+
+**If exactly one directory is found:** use it as `EXPERIMENT_DIR` and inform
+the user:
+```
+Found experiment directory: {MATCHED_DIR}
+```
+
+**If multiple directories are found:** list them all and ask the user to choose:
+```
+Multiple directories found matching template ID "{TEMPLATE_ID_INPUT}":
+  1. ./2025-03-27-10-30-00-az-power-interruption-my-cluster-EXT1a2b3c4d5e6f7/
+  2. ./2025-04-01-15-00-00-az-power-interruption-staging-EXT1a2b3c4d5e6f7/
+
+Which directory do you want to use? (enter number or full path)
+```
+
+**If no directory is found:** inform the user and ask for the full path:
+```
+No experiment directory found matching template ID "{TEMPLATE_ID_INPUT}"
+in the current directory.
+
+Please provide the full path to the experiment directory, e.g.:
+  ./2025-03-27-10-30-00-az-power-interruption-my-cluster-EXT1a2b3c4d5e6f7/
+```
+**Do NOT proceed until the user provides a valid directory path.**
+
+#### Step 1b: Validate required files
+
+Once `EXPERIMENT_DIR` is resolved (from path or template ID), verify it
+contains the required files:
+
+```bash
+EXPERIMENT_DIR="{RESOLVED_PATH}"
 
 # Required files
 ls "${EXPERIMENT_DIR}/experiment-template.json"
@@ -328,8 +380,7 @@ to the terminal. Use the following file naming convention:
 TIMESTAMP=$(date +%Y-%m-%d-%H-%M-%S)
 SCENARIO_SLUG=$(echo "{SCENARIO_NAME}" | tr '[:upper:]' '[:lower:]' | tr ' :/' '-')
 # File name: ${TIMESTAMP}-${SCENARIO_SLUG}-experiment-results.md
-# Save the file in the current working directory (where the user invoked the skill),
-# NOT in the experiment directory
+# Save the file in the experiment directory (EXPERIMENT_DIR)
 ```
 
 **Timeline emphasis:** Timestamps in the report header (Start Time, End Time) use full

@@ -48,8 +48,7 @@ The CFN template **MUST** include the following resources (in dependency order):
 FISRBACLambdaRole:
   Type: AWS::IAM::Role
   Properties:
-    # No RoleName — let CFN auto-generate to avoid 64-char limit issues.
-    # The role is an internal resource; reference it via !GetAtt FISRBACLambdaRole.Arn.
+    RoleName: !Sub 'fis-lambda-role-${RandomSuffix}'
     AssumeRolePolicyDocument:
       Version: '2012-10-17'
       Statement:
@@ -106,7 +105,7 @@ FISRBACLambdaFunction:
     - FISRBACLambdaRole
     - LambdaEKSAccessEntry
   Properties:
-    FunctionName: !Sub 'fis-rbac-mgr-${AWS::StackName}'
+     FunctionName: !Sub 'fis-rbac-${RandomSuffix}'
     Runtime: python3.12
     Handler: index.handler
     Role: !GetAtt FISRBACLambdaRole.Arn
@@ -355,7 +354,7 @@ in addition to existing ones:
     "lambda:TagResource",
     "lambda:UntagResource"
   ],
-  "Resource": "arn:aws:lambda:*:*:function:fis-rbac-mgr-*"
+  "Resource": "arn:aws:lambda:*:*:function:fis-rbac-*"
 },
 {
   "Sid": "IAMPassRoleToLambda",
@@ -385,10 +384,10 @@ in addition to existing ones:
 
 ## IAM Role Name Length
 
-The Lambda Execution Role (`FISRBACLambdaRole`) does NOT specify a `RoleName` — CFN
-auto-generates a unique name, avoiding 64-char limit issues. The FIS Experiment Role
-(`FISExperimentRole`) uses `FISRole-{ExperimentName}` — see SKILL.md Step 6b for
-length budget details.
+The Lambda Execution Role (`FISRBACLambdaRole`) uses `fis-lambda-role-{RandomSuffix}` and
+the FIS Experiment Role (`FISExperimentRole`) uses `fis-role-{RandomSuffix}` — both use
+short prefixes with `RandomSuffix` to stay well within the 64-char IAM role name limit.
+See SKILL.md Step 6b for the full naming table.
 
 ## CFN Deployment Notes
 
