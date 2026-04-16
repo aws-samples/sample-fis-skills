@@ -23,7 +23,7 @@ npx skills add aws-samples/sample-fis-skills --list
 |-------|-------------|
 | [aws-fis-experiment-prepare](./aws-fis-experiment-prepare/) | Generate all configuration files needed to run an AWS FIS experiment (experiment template, IAM policy, CFN template, alarms, dashboard, expected-behavior doc), then deploy via CloudFormation with self-healing iteration. Supports both Scenario Library pre-built scenarios and custom single FIS actions. **Note:** Scenario Library templates (AZ Power Interruption, AZ Application Slowdown, Cross-AZ Traffic Slowdown, Cross-Region Connectivity) cannot be generated via API — the skill reads AWS documentation to extract the JSON templates. |
 | [aws-fis-experiment-execute](./aws-fis-experiment-execute/) | Deploy and run a prepared AWS FIS experiment. Expects a prepared experiment directory (from aws-fis-experiment-prepare) and handles deployment, experiment start, real-time monitoring, and cleanup. |
-| [eks-app-log-analysis](./eks-app-log-analysis/) | Analyze EKS application logs during or after FIS fault injection experiments. Supports real-time monitoring (background log collection + live insights) and post-hoc analysis. Generates comprehensive reports with error timelines, patterns, and recovery analysis grouped by affected services. |
+| [app-service-log-analysis](./app-service-log-analysis/) | Analyze application and managed service logs during or after FIS fault injection experiments. Supports real-time monitoring (background log collection + live insights) and post-hoc analysis. Generates comprehensive reports with error timelines, patterns, and recovery analysis grouped by affected services. |
 
 ## Prerequisites
 

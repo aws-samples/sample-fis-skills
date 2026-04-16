@@ -8,12 +8,7 @@ All placeholders use `{CURLY_BRACES}` notation.
 ```
 ./{yyyy-mm-dd-HH-MM-SS}-{scenario-slug}-{target-slug}[-{context-slug}]-{TEMPLATE_ID}/
 ├── README.md
-├── experiment-template.json
-├── iam-policy.json
-├── cfn-template.yaml
-└── alarms/
-    ├── stop-condition-alarms.json
-    └── dashboard.json
+└── cfn-template.yaml
 ```
 
 **Naming convention for scenario-slug:**
@@ -51,7 +46,7 @@ output — users need the exact stack name for cleanup commands.
 ```markdown
 # FIS Experiment: {Scenario Name}
 
-**Directory:** {OUTPUT_DIR}
+**Directory:** {OUTPUT_DIR_FULL_PATH}
 **Region:** {REGION}
 **Target AZ:** {AZ_ID} (if applicable)
 **Created:** {TIMESTAMP}
@@ -72,11 +67,7 @@ output — users need the exact stack name for cleanup commands.
 
 | File | Purpose |
 |---|---|
-| `experiment-template.json` | FIS experiment template for CLI creation |
-| `iam-policy.json` | IAM policy for the FIS execution role |
-| `cfn-template.yaml` | CloudFormation template (all-in-one) |
-| `alarms/stop-condition-alarms.json` | CloudWatch alarm definitions |
-| `alarms/dashboard.json` | CloudWatch dashboard definition |
+| `cfn-template.yaml` | CloudFormation template (all-in-one: IAM Role, FIS Template, Dashboard, Alarms) |
 
 ## How to Execute
 
@@ -107,7 +98,7 @@ aws fis start-experiment \
 
 ## Monitoring During Experiment
 
-- **CloudWatch Dashboard:** Deploy `alarms/dashboard.json` or view metrics in the console
+- **CloudWatch Dashboard:** View the dashboard deployed by the CFN stack in the CloudWatch console
 - **Experiment Status:** `aws fis get-experiment --id {EXPERIMENT_ID} --region {REGION}`
 
 ## Cleanup
@@ -133,75 +124,6 @@ To start the experiment:
 - Use aws-fis-experiment-execute skill, OR
 - Manually: `aws fis start-experiment --experiment-template-id {TEMPLATE_ID} --region {REGION}`
 ```
-
----
-
-## experiment-template.json
-
-See `references/scenario-templates.md` for scenario-specific templates.
-
-**Key requirements:**
-- Must be valid input for `aws fis create-experiment-template --cli-input-json`
-- All placeholder values must be replaced with actual values
-- `roleArn` should reference the IAM role created in the same workflow
-- `stopConditions` defaults to `[{"source": "none"}]`; only use
-  `"source": "aws:cloudwatch:alarm"` with an alarm ARN if the user explicitly provides one
-
----
-
-## iam-policy.json
-
-This file documents the IAM permissions for the FIS execution role. The CFN template
-uses AWS managed policies as the base (see `ManagedPolicyArns` in cfn-template.yaml).
-This file captures any **additional inline permissions** not covered by managed policies.
-
-```json
-{
-    "Version": "2012-10-17",
-    "Statement": [
-        {
-            "Sid": "FISActions",
-            "Effect": "Allow",
-            "Action": [
-                "{list of specific permissions needed by FIS actions}"
-            ],
-            "Resource": "{specific resource ARNs or *}"
-        },
-        {
-            "Sid": "FISLogging",
-            "Effect": "Allow",
-            "Action": [
-                "logs:CreateLogDelivery",
-                "logs:PutLogEvents",
-                "logs:CreateLogStream"
-            ],
-            "Resource": "*"
-        }
-    ]
-}
-```
-
-**Permission mapping for common FIS actions:**
-
-| FIS Action | Required IAM Permissions |
-|---|---|
-| `aws:ec2:stop-instances` | `ec2:StopInstances`, `ec2:StartInstances`, `ec2:DescribeInstances` |
-| `aws:ec2:api-insufficient-instance-capacity-error` | `ec2:InjectApiError` |
-| `aws:ec2:asg-insufficient-instance-capacity-error` | `ec2:InjectApiError` |
-| `aws:network:disrupt-connectivity` | `ec2:CreateNetworkAcl*`, `ec2:DeleteNetworkAcl*`, `ec2:DescribeNetworkAcl*`, `ec2:ReplaceNetworkAclAssociation` |
-| `aws:rds:failover-db-cluster` | `rds:FailoverDBCluster`, `rds:DescribeDBClusters` |
-| `aws:elasticache:replicationgroup-interrupt-az-power` | `elasticache:InterruptClusterAzPower`, `elasticache:DescribeReplicationGroups` |
-| `aws:ebs:pause-io` | `ec2:PauseVolumeIO`, `ec2:DescribeVolumes` |
-| `aws:ssm:send-command` | `ssm:SendCommand`, `ssm:GetCommandInvocation`, `ssm:ListCommands` |
-| `aws:eks:pod-delete` | `eks:DescribeCluster`, `ec2:DescribeSubnets`, `tag:GetResources` |
-| `aws:eks:pod-network-latency` | `eks:DescribeCluster`, `ec2:DescribeSubnets`, `tag:GetResources` |
-| `aws:eks:pod-cpu-stress` | `eks:DescribeCluster`, `ec2:DescribeSubnets`, `tag:GetResources` |
-| `aws:eks:pod-memory-stress` | `eks:DescribeCluster`, `ec2:DescribeSubnets`, `tag:GetResources` |
-| `aws:eks:pod-io-stress` | `eks:DescribeCluster`, `ec2:DescribeSubnets`, `tag:GetResources` |
-
-**Note:** EKS Pod fault injection actions also require Kubernetes RBAC permissions.
-Use `AWS::EKS::AccessEntry` in the CFN template (see cfn-template.yaml section) to grant
-FIS the required access. The EKS cluster must have authentication mode `API_AND_CONFIG_MAP` or `API`.
 
 ---
 
@@ -343,9 +265,9 @@ Resources:
         Name: !Ref ExperimentName
         Scenario: '{SCENARIO_TYPE}'
       Targets:
-        # {targets definition matching experiment-template.json}
+        # {targets definition}
       Actions:
-        # {actions definition matching experiment-template.json}
+        # {actions definition}
 
   # --- (Optional) CloudWatch Alarm as Stop Condition ---
   # Include the StopConditionAlarm resource below ONLY if the user explicitly
@@ -408,230 +330,3 @@ Outputs:
     Description: 'FIS Execution Role ARN'
     Value: !GetAtt FISExperimentRole.Arn
 ```
-
----
-
-## alarms/stop-condition-alarms.json
-
-Array of CloudWatch alarm definitions for CLI creation:
-
-```json
-[
-    {
-        "AlarmName": "fis-stop-{EXPERIMENT_NAME}-{SERVICE}",
-        "AlarmDescription": "Stop FIS experiment if {CONDITION}",
-        "Namespace": "{NAMESPACE}",
-        "MetricName": "{METRIC}",
-        "Statistic": "Average",
-        "Period": 60,
-        "EvaluationPeriods": 1,
-        "Threshold": "{VALUE}",
-        "ComparisonOperator": "{OPERATOR}",
-        "TreatMissingData": "breaching",
-        "Dimensions": [
-            {
-                "Name": "{DIM_NAME}",
-                "Value": "{DIM_VALUE}"
-            }
-        ]
-    }
-]
-```
-
----
-
-## alarms/dashboard.json
-
-CloudWatch dashboard body JSON for CLI creation. Include comprehensive per-service
-metrics grouped by: availability, performance, and errors/latency.
-
-Only include sections for services actually affected by the experiment.
-
-```json
-{
-    "widgets": [
-        {
-            "type": "text",
-            "x": 0, "y": 0, "width": 24, "height": 1,
-            "properties": {
-                "markdown": "# FIS Experiment: {SCENARIO_NAME} | Region: {REGION} | AZ: {AZ_ID}"
-            }
-        },
-
-        {"type": "text", "x": 0, "y": 1, "width": 24, "height": 1,
-         "properties": {"markdown": "## ALB Metrics"}},
-        {
-            "type": "metric",
-            "x": 0, "y": 2, "width": 8, "height": 6,
-            "properties": {
-                "title": "Target Health",
-                "metrics": [
-                    ["AWS/ApplicationELB", "HealthyHostCount", "TargetGroup", "{TG}", "LoadBalancer", "{ALB}"],
-                    ["AWS/ApplicationELB", "UnHealthyHostCount", "TargetGroup", "{TG}", "LoadBalancer", "{ALB}"]
-                ],
-                "period": 60, "stat": "Average", "region": "{REGION}", "view": "timeSeries"
-            }
-        },
-        {
-            "type": "metric",
-            "x": 8, "y": 2, "width": 8, "height": 6,
-            "properties": {
-                "title": "Requests & Errors",
-                "metrics": [
-                    ["AWS/ApplicationELB", "RequestCount", "LoadBalancer", "{ALB}"],
-                    ["AWS/ApplicationELB", "HTTPCode_ELB_5XX_Count", "LoadBalancer", "{ALB}"],
-                    ["AWS/ApplicationELB", "HTTPCode_Target_5XX_Count", "TargetGroup", "{TG}", "LoadBalancer", "{ALB}"]
-                ],
-                "period": 60, "stat": "Sum", "region": "{REGION}", "view": "timeSeries"
-            }
-        },
-        {
-            "type": "metric",
-            "x": 16, "y": 2, "width": 8, "height": 6,
-            "properties": {
-                "title": "Latency & Connections",
-                "metrics": [
-                    ["AWS/ApplicationELB", "TargetResponseTime", "LoadBalancer", "{ALB}"],
-                    ["AWS/ApplicationELB", "ActiveConnectionCount", "LoadBalancer", "{ALB}"],
-                    ["AWS/ApplicationELB", "RejectedConnectionCount", "LoadBalancer", "{ALB}"]
-                ],
-                "period": 60, "stat": "Average", "region": "{REGION}", "view": "timeSeries"
-            }
-        },
-
-        {"type": "text", "x": 0, "y": 8, "width": 24, "height": 1,
-         "properties": {"markdown": "## EC2 Metrics"}},
-        {
-            "type": "metric",
-            "x": 0, "y": 9, "width": 12, "height": 6,
-            "properties": {
-                "title": "Instance Health",
-                "metrics": [
-                    ["AWS/EC2", "StatusCheckFailed", "InstanceId", "{INSTANCE_ID}"],
-                    ["AWS/EC2", "StatusCheckFailed_Instance", "InstanceId", "{INSTANCE_ID}"],
-                    ["AWS/EC2", "StatusCheckFailed_System", "InstanceId", "{INSTANCE_ID}"]
-                ],
-                "period": 60, "stat": "Maximum", "region": "{REGION}", "view": "timeSeries"
-            }
-        },
-        {
-            "type": "metric",
-            "x": 12, "y": 9, "width": 12, "height": 6,
-            "properties": {
-                "title": "CPU & Network",
-                "metrics": [
-                    ["AWS/EC2", "CPUUtilization", "InstanceId", "{INSTANCE_ID}"],
-                    ["AWS/EC2", "NetworkIn", "InstanceId", "{INSTANCE_ID}"],
-                    ["AWS/EC2", "NetworkOut", "InstanceId", "{INSTANCE_ID}"]
-                ],
-                "period": 60, "stat": "Average", "region": "{REGION}", "view": "timeSeries"
-            }
-        },
-
-        {"type": "text", "x": 0, "y": 15, "width": 24, "height": 1,
-         "properties": {"markdown": "## RDS / Aurora Metrics"}},
-        {
-            "type": "metric",
-            "x": 0, "y": 16, "width": 8, "height": 6,
-            "properties": {
-                "title": "Connections & Memory",
-                "metrics": [
-                    ["AWS/RDS", "DatabaseConnections", "DBInstanceIdentifier", "{DB_ID}"],
-                    ["AWS/RDS", "FreeableMemory", "DBInstanceIdentifier", "{DB_ID}"]
-                ],
-                "period": 60, "stat": "Average", "region": "{REGION}", "view": "timeSeries"
-            }
-        },
-        {
-            "type": "metric",
-            "x": 8, "y": 16, "width": 8, "height": 6,
-            "properties": {
-                "title": "Latency & IOPS",
-                "metrics": [
-                    ["AWS/RDS", "ReadLatency", "DBInstanceIdentifier", "{DB_ID}"],
-                    ["AWS/RDS", "WriteLatency", "DBInstanceIdentifier", "{DB_ID}"],
-                    ["AWS/RDS", "CommitLatency", "DBInstanceIdentifier", "{DB_ID}"],
-                    ["AWS/RDS", "ReadIOPS", "DBInstanceIdentifier", "{DB_ID}"],
-                    ["AWS/RDS", "WriteIOPS", "DBInstanceIdentifier", "{DB_ID}"]
-                ],
-                "period": 60, "stat": "Average", "region": "{REGION}", "view": "timeSeries"
-            }
-        },
-        {
-            "type": "metric",
-            "x": 16, "y": 16, "width": 8, "height": 6,
-            "properties": {
-                "title": "Replication",
-                "metrics": [
-                    ["AWS/RDS", "AuroraReplicaLag", "DBClusterIdentifier", "{CLUSTER_ID}"],
-                    ["AWS/RDS", "ReplicaLag", "DBInstanceIdentifier", "{DB_ID}"]
-                ],
-                "period": 60, "stat": "Average", "region": "{REGION}", "view": "timeSeries"
-            }
-        },
-
-        {"type": "text", "x": 0, "y": 22, "width": 24, "height": 1,
-         "properties": {"markdown": "## EKS Metrics"}},
-        {
-            "type": "metric",
-            "x": 0, "y": 23, "width": 12, "height": 6,
-            "properties": {
-                "title": "Pod Health",
-                "metrics": [
-                    ["ContainerInsights", "pod_number_of_running_pods", "ClusterName", "{CLUSTER}", "Namespace", "{NS}"],
-                    ["ContainerInsights", "pod_number_of_container_restarts", "ClusterName", "{CLUSTER}", "Namespace", "{NS}"]
-                ],
-                "period": 60, "stat": "Average", "region": "{REGION}", "view": "timeSeries"
-            }
-        },
-        {
-            "type": "metric",
-            "x": 12, "y": 23, "width": 12, "height": 6,
-            "properties": {
-                "title": "Node Health",
-                "metrics": [
-                    ["ContainerInsights", "node_cpu_utilization", "ClusterName", "{CLUSTER}"],
-                    ["ContainerInsights", "node_memory_utilization", "ClusterName", "{CLUSTER}"],
-                    ["ContainerInsights", "node_number_of_running_pods", "ClusterName", "{CLUSTER}"]
-                ],
-                "period": 60, "stat": "Average", "region": "{REGION}", "view": "timeSeries"
-            }
-        },
-
-        {"type": "text", "x": 0, "y": 29, "width": 24, "height": 1,
-         "properties": {"markdown": "## ElastiCache Metrics"}},
-        {
-            "type": "metric",
-            "x": 0, "y": 30, "width": 12, "height": 6,
-            "properties": {
-                "title": "Replication & Connections",
-                "metrics": [
-                    ["AWS/ElastiCache", "ReplicationLag", "ReplicationGroupId", "{RG_ID}"],
-                    ["AWS/ElastiCache", "EngineCPUUtilization", "ReplicationGroupId", "{RG_ID}"],
-                    ["AWS/ElastiCache", "CurrConnections", "ReplicationGroupId", "{RG_ID}"],
-                    ["AWS/ElastiCache", "NewConnections", "ReplicationGroupId", "{RG_ID}"]
-                ],
-                "period": 60, "stat": "Average", "region": "{REGION}", "view": "timeSeries"
-            }
-        },
-        {
-            "type": "metric",
-            "x": 12, "y": 30, "width": 12, "height": 6,
-            "properties": {
-                "title": "Cache Performance",
-                "metrics": [
-                    ["AWS/ElastiCache", "CacheHitRate", "ReplicationGroupId", "{RG_ID}"],
-                    ["AWS/ElastiCache", "CacheMisses", "ReplicationGroupId", "{RG_ID}"],
-                    ["AWS/ElastiCache", "Evictions", "ReplicationGroupId", "{RG_ID}"]
-                ],
-                "period": 60, "stat": "Average", "region": "{REGION}", "view": "timeSeries"
-            }
-        }
-    ]
-}
-```
-
-**Notes:**
-- Remove widget sections for services not involved in the experiment
-- Add application-specific custom metrics if the user provides them
-- Adjust `y` coordinates when removing service sections to keep layout compact

@@ -26,7 +26,7 @@ Preparing an AWS FIS experiment manually involves several error-prone, tedious s
 3. **Validates compatibility** — Inspects actual resources via AWS CLI (e.g., `describe-db-instances`, `describe-db-clusters`) and cross-checks against FIS action `resourceType` requirements before generating any files.
 4. **Determines monitoring configuration** — Defaults to `source: "none"` (no stop condition alarm). Only creates CloudWatch alarms if the user explicitly provides one. Generates a comprehensive CloudWatch dashboard with per-service availability, performance, and error/latency metrics.
 5. **Reads CFN resource documentation** — Before generating the CFN template, reads the `AWS::FIS::ExperimentTemplate` CloudFormation documentation to ensure the template uses the current property schema.
-6. **Generates configuration files** — Produces a self-contained directory with 6 files: experiment template, IAM policy, CFN template, alarms, dashboard, and README.
+6. **Generates configuration files** — Produces a self-contained directory with 2 files: CFN template and README.
 7. **Deploys with self-healing** — Deploys the CFN template, and if deployment fails, automatically analyzes errors, fixes the template, deletes the failed stack, and retries (up to 5 times).
 8. **Renames directory with template ID** — After successful deployment, appends the experiment template ID to the output directory name (e.g., `2026-04-11-pod-net-pktloss-payment-redis-EXT1a2b3c4d5e6f7/`) for easy identification.
 
@@ -52,17 +52,24 @@ Any valid FIS action ID, e.g.:
 - `aws:elasticache:replicationgroup-interrupt-az-power`
 - `aws:eks:pod-network-latency`
 
+### SSM Automation-Based Fault Injection (Services Without Native FIS Actions)
+
+For AWS services that have **no native FIS action** (e.g., MSK, MQ, Redshift, Neptune, OpenSearch), the skill uses `aws:ssm:start-automation-execution` to invoke an SSM Automation runbook that calls the target service's API directly. This approach creates both the SSM Automation document and the FIS experiment template in a single CFN stack.
+
+Examples:
+- **MSK** — `kafka:RebootBroker` to test Kafka consumer/producer resilience
+- **Amazon MQ** — `mq:RebootBroker` to test ActiveMQ/RabbitMQ client failover
+- **Redshift** — `redshift:RebootCluster` to test data warehouse query resilience
+- **Neptune** — `neptune:FailoverDBCluster` to test graph database client failover
+
+See `references/ssm-automation-generic-api-guide.md` for the full pattern, including SSM Automation runbook templates, two-role IAM design, and CFN integration.
+
 ## Output Directory Structure
 
 ```
 ./{yyyy-mm-dd-HH-MM-SS}-{scenario-slug}-{target-slug}[-{context-slug}]-{TEMPLATE_ID}/
 ├── README.md                          # Experiment overview and execution instructions
-├── experiment-template.json           # FIS experiment template for CLI creation
-├── iam-policy.json                    # Least-privilege IAM permissions
-├── cfn-template.yaml                  # All-in-one CloudFormation template
-└── alarms/
-    ├── stop-condition-alarms.json     # CloudWatch alarm definitions
-    └── dashboard.json                 # CloudWatch dashboard body
+└── cfn-template.yaml                  # All-in-one CloudFormation template
 ```
 
 The optional `{context-slug}` distinguishes experiments with the same scenario and target
@@ -172,8 +179,13 @@ Step 7: Rename output directory (append experiment template ID for easy identifi
 "Prepare an AZ Power Interruption experiment for us-east-1a"
 "Create FIS experiment for aws:rds:failover-db-cluster targeting my Aurora cluster"
 "准备 FIS 实验，测试 AZ 断电对 EKS 和 RDS 的影响"
+"测试 AZ 断电对 RDS 的影响"
 "Generate chaos experiment config for EC2 CPU stress"
 "Set up fault injection test for ElastiCache failover in ap-southeast-1"
+"test AZ failure impact on EC2 and ElastiCache only"
+"Reboot MSK broker to test Kafka consumer resilience"
+"准备 MSK broker 重启的故障注入实验"
+"Create FIS experiment to failover Neptune cluster"
 ```
 
 ## Key Design Decisions
@@ -186,7 +198,7 @@ Step 7: Rename output directory (append experiment template ID for easy identifi
 
 4. **All-in-one CFN template.** The `cfn-template.yaml` contains IAM role, alarms, dashboard, and experiment template. A single `cloudformation deploy` produces everything needed.
 
-5. **Local files stay in sync.** After successful deployment, `experiment-template.json` and `README.md` are updated with real ARNs and stack outputs, so the directory is an accurate record of the deployed experiment.
+5. **Local files stay in sync.** After successful deployment, `README.md` is updated with real ARNs and stack outputs, so the directory is an accurate record of the deployed experiment.
 
 6. **Never starts the experiment.** This skill only prepares and deploys infrastructure. Starting the actual experiment is handled by [aws-fis-experiment-execute](../aws-fis-experiment-execute/) or manually by the user.
 
@@ -195,6 +207,14 @@ Step 7: Rename output directory (append experiment template ID for easy identifi
 8. **EKS RBAC via CFN Custom Resource.** K8s RBAC resources (ServiceAccount, Role, RoleBinding) for EKS Pod actions are managed automatically by a Lambda-backed CFN Custom Resource. Uses fixed standardized names (`fis-sa`, `fis-experiment-role`, `fis-experiment-role-binding`) shared across all experiments in the same namespace. Lambda performs idempotent creation (skip if exists) and does NOT delete RBAC on stack removal, since other experiments may still depend on them. The Lambda uses `botocore.signers.RequestSigner` with `x-k8s-aws-id` header for EKS bearer token generation, which is required for proper EKS API server authentication.
 
 9. **Naming convention prevents collisions.** `ExperimentName` includes a 6-character random suffix, making all CFN physical resource names (IAM Role, Dashboard, Alarm) globally unique. An optional `context-slug` in directory and resource names distinguishes experiments with the same scenario and target but different downstream services (e.g., `payment-redis` vs `payment-msk` for network fault injection).
+
+10. **AZ Power Interruption: one Stack per AZ, shared tags.** The target AZ is hardcoded in multiple locations within the experiment template (filters, action parameters). To test a different AZ, delete the Stack and deploy a new one. Resource tags (`AzImpairmentPower`) do NOT distinguish AZ — the experiment template's internal AZ filters handle that. Tags are applied by a Lambda-backed Custom Resource within the same CFN Stack, requiring zero extra permissions on the EC2 Instance Profile. See `references/az-power-interruption-guide.md` for full details.
+
+11. **Service-scoped sub-action pruning for AZ Power Interruption.** When the user mentions specific services (e.g., "test AZ failure for RDS"), only the relevant sub-actions are included in the experiment template — not the full 10 sub-actions. This prevents unintended impact on other business applications in the same AZ. Mandatory infrastructure sub-actions (Network Connectivity, ARC Zonal Autoshift) are always included unless explicitly excluded by the user. The agent confirms the final sub-action list with the user before generating files.
+
+12. **Default experiment duration is 10 minutes.** All experiment scenarios and sub-actions default to `PT10M` unless the user specifies otherwise. This is shorter than the AWS documentation default of `PT30M` but sufficient for most validation scenarios, and reduces the blast radius window. Time-dependent parameters (e.g., ARC Zonal Autoshift timing) scale proportionally.
+
+13. **SSM Automation for unsupported services.** For AWS services without native FIS actions (MSK, MQ, Redshift, Neptune, OpenSearch, etc.), the skill uses `aws:ssm:start-automation-execution` to invoke an SSM Automation runbook that calls the target service's API directly (e.g., `kafka:RebootBroker`). This requires a two-role IAM pattern: the FIS Experiment Role (trusts `fis.amazonaws.com`) passes an SSM Automation Role (trusts `ssm.amazonaws.com`) that has the target service permissions. Both the SSM document and the FIS experiment template are deployed in a single CFN stack. See `references/ssm-automation-generic-api-guide.md` for full details.
 
 ## Directory Structure
 
@@ -205,8 +225,9 @@ aws-fis-experiment-prepare/
 ├── README_CN.md                          # Chinese version
 └── references/
     ├── output-structure.md               # File format specifications for all 6 output files
-    ├── scenario-templates.md             # FIS Scenario Library JSON template examples
-    └── eks-pod-action-prerequisites.md   # EKS Pod action prerequisites (Lambda + Custom Resource for K8s RBAC)
+    ├── eks-pod-action-prerequisites.md   # EKS Pod action prerequisites (Lambda + Custom Resource for K8s RBAC)
+    ├── az-power-interruption-guide.md    # AZ Power Interruption scenario guide (tagging, permissions, design decisions)
+    └── ssm-automation-generic-api-guide.md  # SSM Automation approach for services without native FIS actions (MSK, MQ, Redshift, Neptune, etc.)
 ```
 
 ## Limitations

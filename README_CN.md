@@ -23,7 +23,7 @@ npx skills add aws-samples/sample-fis-skills --list
 |-------|------|
 | [aws-fis-experiment-prepare](./aws-fis-experiment-prepare/) | 生成运行 AWS FIS 实验所需的所有配置文件（实验模板、IAM 策略、CFN 模板、告警、Dashboard、预期行为文档），然后通过 CloudFormation 自愈迭代部署。支持 Scenario Library 预置场景和自定义单个 FIS Action。**注意：** Scenario Library 模板（AZ Power Interruption、AZ Application Slowdown、Cross-AZ Traffic Slowdown、Cross-Region Connectivity）无法通过 API 生成 — Skill 会读取 AWS 文档提取 JSON 模板。 |
 | [aws-fis-experiment-execute](./aws-fis-experiment-execute/) | 部署并运行已准备好的 AWS FIS 实验。需要一个已准备好的实验目录（来自 aws-fis-experiment-prepare），处理部署、实验启动、实时监控和清理。 |
-| [eks-app-log-analysis](./eks-app-log-analysis/) | 在 FIS 故障注入实验期间或之后分析 EKS 应用日志。支持实时监控（后台日志收集 + 实时洞察）和事后分析。生成按受影响服务分组的综合报告，包含错误时间线、模式识别和恢复分析。 |
+| [app-service-log-analysis](./app-service-log-analysis/) | 在 FIS 故障注入实验期间或之后分析应用程序和托管服务日志。支持实时监控（后台日志收集 + 实时洞察）和事后分析。生成按受影响服务分组的综合报告，包含错误时间线、模式识别和恢复分析。 |
 
 ## 前置条件
 

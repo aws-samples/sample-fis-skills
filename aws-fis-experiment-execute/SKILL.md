@@ -25,10 +25,15 @@ Detect the language of the user's conversation and use the **same language** for
 ## Prerequisites
 
 Required tools:
-- **AWS CLI** — `aws fis`, `aws cloudwatch`, `aws cloudformation`
-- **kubectl** — configured with access to target EKS cluster (**only if** app log collection is enabled)
+- **AWS CLI** — `aws fis`, `aws cloudwatch`, `aws cloudformation`, `aws logs`
+- **kubectl** (optional) — configured with access to target EKS cluster. If not available,
+  application log collection is skipped but managed service logs are still collected.
 - A prepared experiment directory (from aws-fis-experiment-prepare skill)
 - The CloudFormation stack for this experiment **must already be deployed**
+
+**REQUIRED SUB-SKILL:** `app-service-log-analysis` must be installed. Loaded at
+runtime for application discovery, log collection, and analysis. Without it, the
+experiment can still run but log analysis will be skipped.
 
 ## Workflow
 
@@ -42,21 +47,14 @@ digraph execute_flow {
     "Read README for stack name" [shape=box];
     "Check CFN stack status" [shape=diamond];
     "Extract template ID from outputs" [shape=box];
-    "Classify experiment type\n+ display actionIds" [shape=box];
-    "Pod actions present?" [shape=diamond];
-    "ASK user:\nCollect app logs?" [shape=box, style=bold];
-    "Discover apps + start logs\n(eks-app-log-analysis)" [shape=box];
-    "Baseline logs? (user opt-in)" [shape=diamond];
-    "Wait 2 min baseline" [shape=box];
+    "Display actionIds" [shape=box];
+    "Discover apps + start logs\n(app-service-log-analysis)" [shape=box];
     "User confirms experiment start" [shape=diamond, style=bold, color=red];
     "Start experiment" [shape=box];
-    "Monitor experiment" [shape=box];
     "Monitor experiment\n+ log insights" [shape=box];
     "Experiment complete?" [shape=diamond];
-    "Experiment complete? (logs)" [shape=diamond];
-    "Post-baseline? (user opt-in)" [shape=diamond];
-    "Wait 2 min post-baseline" [shape=box];
-    "Stop logs + analyze\n(eks-app-log-analysis)" [shape=box];
+    "Wait 3 min post-baseline" [shape=box];
+    "Stop logs + analyze\n(app-service-log-analysis)" [shape=box];
     "Generate results report" [shape=box];
 
     "User input:\npath or template ID?" -> "Validate files" [label="Full path"];
@@ -69,31 +67,17 @@ digraph execute_flow {
     "Read README for stack name" -> "Check CFN stack status";
     "Check CFN stack status" -> "Extract template ID from outputs" [label="CREATE_COMPLETE"];
     "Check CFN stack status" -> "Generate results report" [label="Not deployed / failed, abort"];
-    "Extract template ID from outputs" -> "Classify experiment type\n+ display actionIds";
-    "Classify experiment type\n+ display actionIds" -> "Pod actions present?";
-    "Pod actions present?" -> "Discover apps + start logs\n(eks-app-log-analysis)" [label="Yes → auto-collect"];
-    "Pod actions present?" -> "ASK user:\nCollect app logs?" [label="No"];
-    "ASK user:\nCollect app logs?" -> "Discover apps + start logs\n(eks-app-log-analysis)" [label="User says Yes"];
-    "ASK user:\nCollect app logs?" -> "User confirms experiment start" [label="User says No"];
-    "Discover apps + start logs\n(eks-app-log-analysis)" -> "Baseline logs? (user opt-in)";
-    "Baseline logs? (user opt-in)" -> "Wait 2 min baseline" [label="Yes"];
-    "Baseline logs? (user opt-in)" -> "User confirms experiment start" [label="No (default)"];
-    "Wait 2 min baseline" -> "User confirms experiment start";
+    "Extract template ID from outputs" -> "Display actionIds";
+    "Display actionIds" -> "Discover apps + start logs\n(app-service-log-analysis)";
+    "Discover apps + start logs\n(app-service-log-analysis)" -> "User confirms experiment start";
     "User confirms experiment start" -> "Start experiment" [label="Yes, I confirm"];
-    "User confirms experiment start" -> "Generate results report" [label="No, abort (no logs)"];
-    "User confirms experiment start" -> "Stop logs + analyze\n(eks-app-log-analysis)" [label="No, abort (with logs)"];
-    "Start experiment" -> "Monitor experiment" [label="no logs"];
-    "Start experiment" -> "Monitor experiment\n+ log insights" [label="with logs"];
-    "Monitor experiment" -> "Experiment complete?";
-    "Monitor experiment\n+ log insights" -> "Experiment complete? (logs)";
-    "Experiment complete?" -> "Monitor experiment" [label="No, poll again"];
-    "Experiment complete?" -> "Generate results report" [label="Yes"];
-    "Experiment complete? (logs)" -> "Monitor experiment\n+ log insights" [label="No, poll again"];
-    "Experiment complete? (logs)" -> "Post-baseline? (user opt-in)" [label="Yes"];
-    "Post-baseline? (user opt-in)" -> "Wait 2 min post-baseline" [label="Yes"];
-    "Post-baseline? (user opt-in)" -> "Stop logs + analyze\n(eks-app-log-analysis)" [label="No (default)"];
-    "Wait 2 min post-baseline" -> "Stop logs + analyze\n(eks-app-log-analysis)";
-    "Stop logs + analyze\n(eks-app-log-analysis)" -> "Generate results report";
+    "User confirms experiment start" -> "Stop logs + analyze\n(app-service-log-analysis)" [label="No, abort"];
+    "Start experiment" -> "Monitor experiment\n+ log insights";
+    "Monitor experiment\n+ log insights" -> "Experiment complete?";
+    "Experiment complete?" -> "Monitor experiment\n+ log insights" [label="No, poll again"];
+    "Experiment complete?" -> "Wait 3 min post-baseline" [label="Yes"];
+    "Wait 3 min post-baseline" -> "Stop logs + analyze\n(app-service-log-analysis)";
+    "Stop logs + analyze\n(app-service-log-analysis)" -> "Generate results report";
 }
 ```
 
@@ -105,182 +89,110 @@ The user provides either:
 
 #### Step 1a: Resolve directory from template ID
 
-If the user provides a template ID instead of a directory path, search the
-**current working directory** for a directory whose name ends with that ID:
+If the user provides a template ID, search CWD for directories ending with that ID:
 
 ```bash
-TEMPLATE_ID_INPUT="{USER_PROVIDED_TEMPLATE_ID}"
-
-# Search for directories ending with the template ID (case-sensitive)
-MATCHED_DIRS=$(find . -maxdepth 1 -type d -name "*-${TEMPLATE_ID_INPUT}" -o -type d -name "*${TEMPLATE_ID_INPUT}" 2>/dev/null | head -5)
+find . -maxdepth 1 -type d -name "*${TEMPLATE_ID_INPUT}" 2>/dev/null
 ```
 
-**If exactly one directory is found:** use it as `EXPERIMENT_DIR` and inform
-the user:
-```
-Found experiment directory: {MATCHED_DIR}
-```
+- **1 match** → use it, inform user
+- **Multiple matches** → list and ask user to choose
+- **No match** → ask user for full path. Do NOT proceed without a valid path.
 
-**If multiple directories are found:** list them all and ask the user to choose:
-```
-Multiple directories found matching template ID "{TEMPLATE_ID_INPUT}":
-  1. ./2025-03-27-10-30-00-az-power-interruption-my-cluster-EXT1a2b3c4d5e6f7/
-  2. ./2025-04-01-15-00-00-az-power-interruption-staging-EXT1a2b3c4d5e6f7/
+#### Step 1b: Extract template ID from directory name
 
-Which directory do you want to use? (enter number or full path)
-```
-
-**If no directory is found:** inform the user and ask for the full path:
-```
-No experiment directory found matching template ID "{TEMPLATE_ID_INPUT}"
-in the current directory.
-
-Please provide the full path to the experiment directory, e.g.:
-  ./2025-03-27-10-30-00-az-power-interruption-my-cluster-EXT1a2b3c4d5e6f7/
-```
-**Do NOT proceed until the user provides a valid directory path.**
-
-#### Step 1b: Validate required files
-
-Once `EXPERIMENT_DIR` is resolved (from path or template ID), verify it
-contains the required files:
+The experiment directory name ends with the template ID (e.g.,
+`2026-04-11-az-power-int-my-cluster-EXT1a2b3c4d5e6f7`). Extract it:
 
 ```bash
-EXPERIMENT_DIR="{RESOLVED_PATH}"
-
-# Required files
-ls "${EXPERIMENT_DIR}/experiment-template.json"
-ls "${EXPERIMENT_DIR}/iam-policy.json"
-ls "${EXPERIMENT_DIR}/cfn-template.yaml"
-ls "${EXPERIMENT_DIR}/README.md"
-
-# Optional files
-ls "${EXPERIMENT_DIR}/alarms/stop-condition-alarms.json" 2>/dev/null
-ls "${EXPERIMENT_DIR}/alarms/dashboard.json" 2>/dev/null
+TEMPLATE_ID=$(basename "${EXPERIMENT_DIR}" | grep -oE 'EXT[a-zA-Z0-9]+$')
 ```
 
-### Step 2: Read README and Extract Stack Information
+Store as `TEMPLATE_ID`. This is used in all subsequent steps.
+
+#### Step 1c: Validate required files
+
+Verify `EXPERIMENT_DIR` contains: `cfn-template.yaml`, `README.md`.
+
+### Step 2: Read README and Extract Experiment Metadata
 
 Read `README.md` from the experiment directory to extract:
 
-1. **CFN Stack Name** — look for the line `**CFN Stack:** {STACK_NAME}` in the
-   README header block (near the top, after the H1 heading). This is the stack
-   name assigned by `aws-fis-experiment-prepare` during deployment.
-2. **Scenario name** — from the H1 heading (e.g., `# FIS Experiment: AZ Power Interruption`)
-3. **Target region** — from `**Region:** {REGION}`
-4. **Target AZ** — from `**Target AZ:** {AZ_ID}` (if applicable)
-5. **Estimated duration** — from `**Estimated Duration:** {DURATION}`
-6. **Affected resources** — from the "Affected Resources" table
+1. **Scenario name** — from the H1 heading (e.g., `# FIS Experiment: AZ Power Interruption`)
+2. **Target region** — from `**Region:** {REGION}`
+3. **Target AZ** — from `**Target AZ:** {AZ_ID}` (if applicable)
+4. **Estimated duration** — from `**Estimated Duration:** {DURATION}`
+5. **Affected resources** — from the "Affected Resources" table
+6. **CFN Stack Name** — from `**CFN Stack:** {STACK_NAME}` (for cleanup reference only)
 
 Present a summary to the user with all extracted information.
 
-**If the CFN Stack Name cannot be found in the README**, stop and inform the
-user that the stack name is missing. The experiment cannot proceed without it.
+### Step 3: Display Experiment Actions
 
-### Step 3: Check CloudFormation Stack Status
+Use `TEMPLATE_ID` (extracted from directory name in Step 1b) to query the experiment
+template via AWS CLI and display all action IDs:
 
-Using the stack name and region extracted from the README, verify the stack is deployed.
-See `references/cli-commands.md` for CLI commands and stack status reference.
-
-Only proceed if the stack is in a ready state (`CREATE_COMPLETE` or `UPDATE_COMPLETE`).
-
-**If the stack is not ready**, inform the user clearly:
-- Show the current stack status and failure reason (if applicable)
-- Suggest running `aws-fis-experiment-prepare` to deploy the stack
-- Do NOT attempt to deploy the stack — this skill only checks and executes
-
-### Step 4: Extract Experiment Template ID from Stack Outputs
-
-Extract `ExperimentTemplateId` from stack outputs. See `references/cli-commands.md` for CLI commands.
-
-**If `ExperimentTemplateId` is not found**, list all outputs and ask the user which one contains the template ID. Common alternatives: `FISExperimentTemplateId`, `TemplateId`.
-
-Also extract dashboard URL and alarm ARNs if available.
-
-### Step 5: Classify Experiment and Determine Log Collection
-
-**You MUST complete this step BEFORE proceeding to Step 6.** The classification
-result determines whether Step 6 collects application logs or asks the user first.
-Do NOT skip this step. Do NOT assume the experiment type.
-
-Read `experiment-template.json` from the experiment directory. Extract all `actionId`
-values from the `actions` map. Determine whether any `actionId` starts with
-`aws:eks:pod-` (e.g., `pod-network-latency`, `pod-delete`, `pod-cpu-stress`).
-
-For **Scenario Library templates** (where actions may be opaque or use custom resource
-injection such as `aws:eks:inject-kubernetes-custom-resource`): if the scenario name or
-README description indicates pod-level fault injection, treat as pod experiment.
-Otherwise treat as non-pod experiment.
-
-Display the classification to the user:
+```bash
+aws fis get-experiment-template \
+  --id "{TEMPLATE_ID}" \
+  --region {REGION} \
+  --query 'experimentTemplate.actions' --output json
 ```
-Experiment type: {POD (aws:eks:pod-*) | NON-POD}
+
+Extract all `actionId` values from the actions map and display them to the user:
+
+```
 Actions found:
   - {actionId_1}
   - {actionId_2}
   ...
 ```
 
-**If ANY `aws:eks:pod-*` action is present:** auto-select `COLLECT_APP_LOGS=true`.
-Inform the user:
-```
-Pod experiment detected — app log collection is enabled automatically.
-```
-Proceed directly to Step 6.
+Proceed directly to Step 4 (log collection is always enabled).
 
-**If NO `aws:eks:pod-*` action is present:** you MUST ask the user.
+### Step 4: Discover EKS Applications and Start Log Collection
 
-**STOP. Do NOT load `eks-app-log-analysis` yet.** Do NOT proceed to Step 6.
-Do NOT decide for the user. You MUST present the question below and **stop output
-to wait for their reply** — just like the experiment confirmation in Step 7.
-
-```
-This experiment targets infrastructure components (not pods directly).
-Would you like to collect application logs to observe upstream impact?
-(Infrastructure faults may cascade to application-level errors such as
-connection timeouts and failover retries.)
-
-  [No]  — Skip app log collection (default, press Enter)
-  [Yes] — Discover EKS apps and collect logs (requires kubectl)
-```
-
-**Do NOT continue until the user has responded.** This is a mandatory interaction
-point — you cannot choose on behalf of the user.
-
-Store the result as `COLLECT_APP_LOGS=true|false`.
-
-- **No (default for non-pod experiments):** Skip Steps 6 and 9 entirely. Steps 7, 8,
-  and 10 run without any log-related content (no "Applications being monitored" in the
-  warning, no log insights during monitoring, no Application Log Analysis section in
-  the report).
-- **Yes:** Proceed to Step 6 to load `eks-app-log-analysis` skill and start log collection.
-
-### Step 6: Discover EKS Applications and Start Log Collection
-
-**Only execute this step if `COLLECT_APP_LOGS=true`.**
-
-**REQUIRED:** You MUST load the `eks-app-log-analysis` skill at this point. It contains
-the detailed procedures for application discovery and log collection. Load it now and
-execute its real-time mode steps as described below.
+**REQUIRED:** You MUST use the `skill` tool to load the `app-service-log-analysis`
+skill NOW, before proceeding. Call: `skill(name="app-service-log-analysis")`.
+This injects the skill's instructions into your context so you can execute its
+steps. If the skill is not installed or cannot be loaded, inform the user and
+skip log collection (the experiment can still run without it).
 
 This step runs **BEFORE** the experiment starts — discovering applications after the
 experiment begins risks missing early log entries that get rotated or overwritten.
 
-Execute from `eks-app-log-analysis` skill:
-1. **Its Step 3 (Collect Application Dependencies)** — auto-discover EKS apps depending on
-   affected AWS services (from README's "Affected Resources" table), then confirm with user
-2. **Its Step 4 (Log Collection — Real-time Mode)** — start background `kubectl logs -f`
-   for all confirmed applications
+#### kubectl Availability Check
 
-#### Optional: Baseline Log Collection (User Opt-In)
+Before starting app log collection, verify that `kubectl` is available:
 
-**Default: skip baseline.** Only collect baseline logs if the user explicitly requests
-"collect baseline logs" or "capture pre/post experiment logs" or similar.
+```bash
+kubectl version --client -o yaml 2>/dev/null
+```
 
-If opted in: wait 2 minutes after starting log collection to capture normal-state logs
-as baseline, then proceed to experiment confirmation.
+**If kubectl is NOT available:**
+- Skip app discovery and app log collection
+- **Still execute `app-service-log-analysis` Step 3.5 (Detect and Collect Managed
+  Service Logs)** — this only requires AWS CLI, not kubectl
+- Inform the user:
+  ```
+  kubectl not available — skipping application log collection.
+  Managed service logs (EKS control plane, RDS, etc.) will still be collected.
+  ```
 
-### Step 7: Start Experiment (CRITICAL CONFIRMATION)
+**If kubectl IS available**, execute from `app-service-log-analysis` skill:
+
+1. **Its "Multi-Cluster EKS Discovery and Kubeconfig Isolation" section** — discovers
+   all EKS clusters in the target region, generates isolated kubeconfig per cluster
+   (never overwrites `~/.kube/config`), verifies access to each cluster
+2. **Its Step 3 (Collect Application Dependencies — Deep Scan)** — resolves service
+   endpoints, deep-scans all accessible clusters in parallel, confirms discovered
+   dependencies with user
+3. **Its Step 3.5 (Detect and Collect Managed Service Logs)** — checks managed service
+   CloudWatch logging status, records log groups for later analysis
+4. **Its Step 4 (Log Collection — Real-time Mode)** — starts background `kubectl logs -f`
+   for all confirmed applications across all clusters
+
+### Step 5: Start Experiment (CRITICAL CONFIRMATION)
 
 **This is the most dangerous step. The experiment WILL affect real resources.**
 
@@ -295,7 +207,6 @@ Target AZ:   {AZ_ID}
 Duration:    {DURATION}
 Stack:       {STACK_NAME} (verified: CREATE_COMPLETE)
 Template ID: {TEMPLATE_ID}
-Experiment type: {POD (aws:eks:pod-*) | NON-POD}
 
 Resources that WILL be affected:
   - {list each affected resource type and count from README}
@@ -303,24 +214,24 @@ Resources that WILL be affected:
 Stop Conditions:
   - {list each alarm that will stop the experiment}
 
+Applications being monitored:
+  - {list each namespace/deployment from SERVICE_APP_MAP, or "N/A (kubectl not available)" if skipped}
+
+Managed service log collection:
+  - {list each service with logging status from Step 6}
+
+Log directory: {LOG_DIR}
+Post-experiment baseline: 3 minutes (automatic)
+
 Type "Yes, start experiment" to proceed, or "No" to abort.
 ```
 
-**If `COLLECT_APP_LOGS=true`**, also include in the warning:
-
-```
-Applications being monitored:
-  - {list each namespace/deployment from SERVICE_APP_MAP}
-
-Log collection: ACTIVE (collecting to {LOG_DIR})
-```
-
-**Only proceed if the user explicitly confirms.** If user aborts and
-`COLLECT_APP_LOGS=true`, proceed to Step 9 to stop log collection first.
+**Only proceed if the user explicitly confirms.** If user aborts, proceed to Step 7
+to stop log collection and clean up first.
 
 Save the returned `experiment.id`.
 
-### Step 8: Monitor Experiment
+### Step 6: Monitor Experiment
 
 Poll the experiment status and display progress. See `references/cli-commands.md` for
 polling commands and experiment status reference.
@@ -336,36 +247,41 @@ polling commands and experiment status reference.
   Query service-specific status (e.g., RDS instance status, ElastiCache replication
   group status, EKS node status) during monitoring to capture detailed observations.
 
-**If `COLLECT_APP_LOGS=true` — log insights during each poll cycle:** Execute
-`eks-app-log-analysis` Step 5 (Real-time Monitoring Display) — read recent logs, count
-errors/warnings, display per-app summary, detect recovery signals. The skill must
-already be loaded from Step 6.
+**Log insights during each poll cycle:** If `app-service-log-analysis` skill was
+loaded in Step 4, execute its Step 5
+(Real-time Monitoring Display) — read recent logs, count errors/warnings, display
+per-app summary, detect recovery signals. If app log collection was skipped (kubectl
+not available), show only managed service log status. The skill must already be loaded
+from Step 4.
 
 **During monitoring, remind the user:**
 - Check the CloudWatch dashboard for real-time metrics
 - The experiment can be stopped at any time (see `references/cli-commands.md` for stop command)
 
-### Step 9: Stop Log Collection and Analyze
-
-**Only execute this step if `COLLECT_APP_LOGS=true`.** If log collection was skipped,
-proceed directly to Step 10.
+### Step 7: Post-Experiment Baseline, Stop Log Collection and Analyze
 
 After the experiment completes (any terminal state):
 
-#### Optional: Post-Experiment Baseline (User Opt-In)
+#### Post-Experiment Baseline (3 minutes)
 
-**Default: stop immediately.** Only continue collecting post-experiment logs if the
-user opted in to baseline collection in Step 6.
+Continue collecting logs for **3 minutes** after the experiment ends to capture
+recovery behavior. This applies to both application logs (if kubectl is available)
+and managed service logs. Display a countdown to the user:
 
-If opted in: wait 2 minutes after experiment ends to capture recovery behavior logs,
-then stop collection.
+```
+Experiment completed. Collecting post-experiment baseline logs...
+Remaining: {countdown} (3 minutes total)
+```
+
+After the 3-minute baseline window ends, proceed to analysis.
 
 #### Generate Application Log Analysis
 
-Execute `eks-app-log-analysis` Steps 7-8 (skill already loaded from Step 6):
+If `app-service-log-analysis` skill was loaded in Step 4, execute its Steps 7-8:
 - **Its Step 7 (Generate Analysis Report)** — analyze error patterns, peak rates, recovery
-  times, and generate the "Application Log Analysis" section of the report
-- **Its Step 8 (Cleanup)** — kill background `kubectl logs` processes
+  times, and generate the "Application Log Analysis" section of the report. The analysis
+  time window extends 3 minutes past the experiment end time to cover the baseline period.
+- **Its Step 8 (Cleanup)** — kill background `kubectl logs` processes (if any were started)
 
 The application log analysis output is embedded into the experiment results report
 (see Step 10 below), NOT saved as a separate file.
@@ -373,121 +289,22 @@ The application log analysis output is embedded into the experiment results repo
 ### Step 10: Save Results Report to Local File
 
 After the experiment completes (any terminal state), generate a results report and
-**write it directly to a local markdown file** instead of outputting the full content
-to the terminal. Use the following file naming convention:
+**write it directly to a local markdown file** in the experiment directory.
 
-```bash
-TIMESTAMP=$(date +%Y-%m-%d-%H-%M-%S)
-SCENARIO_SLUG=$(echo "{SCENARIO_NAME}" | tr '[:upper:]' '[:lower:]' | tr ' :/' '-')
-# File name: ${TIMESTAMP}-${SCENARIO_SLUG}-experiment-results.md
-# Save the file in the experiment directory (EXPERIMENT_DIR)
-```
-
-**Timeline emphasis:** Timestamps in the report header (Start Time, End Time) use full
-ISO 8601 with timezone (e.g., `2025-03-30T14:05:32+08:00`). However, in timeline tables
-and action results, use **time-only format in UTC** (e.g., `05:05:32`) — the report date
-is already in the header, so repeating the date on every row adds clutter. Mark the
-column header as "Time (UTC)" so the timezone is clear. No milliseconds anywhere. Timeline events are embedded directly
-into each service's impact analysis section — do NOT create a separate standalone
-timeline section. This allows readers to see the full picture (timeline + impact +
-findings) for each service without jumping between sections.
+See `references/report-template.md` for the complete report structure, file naming
+convention, and timestamp format rules.
 
 **Per-service analysis:** Identify all services affected by the experiment from the
-README's "Affected Resources" table. For each service, create a sub-section under
-"Per-Service Impact Analysis" that includes: (1) the timeline events relevant to that
-service, (2) observed behavior from monitoring, (3) key findings. Also check for
-indirectly affected services (e.g., MSK affected by network disruption) and include
-them.
+README's "Affected Resources" table. For each service, create a sub-section with:
+(1) timeline events, (2) observed behavior, (3) key findings. Include indirectly
+affected services.
 
-The results report file must include:
-
-```markdown
-## FIS Experiment Results
-
-**Experiment ID:** {EXPERIMENT_ID}
-**Template ID:**   {TEMPLATE_ID}
-**Stack:**         {STACK_NAME}
-**Status:**        {FINAL_STATUS}
-**Start Time:**    {START_TIME}
-**End Time:**      {END_TIME}
-**Duration:**      {ACTUAL_DURATION}
-
-### Action Results
-
-| Action | Action ID | Status | Start (UTC) | End (UTC) | Duration |
-|---|---|---|---|---|---|
-| {action_name} | {action_id} | {status} | {HH:MM:SS} | {HH:MM:SS} | {duration} |
-
-### Stop Condition Alarms
-
-| Alarm | Final Status |
-|---|---|
-| {alarm_name} | {OK/ALARM} |
-
-### Per-Service Impact Analysis
-
-For EACH service listed in the README's "Affected Resources" table, create a sub-section below.
-Also include indirectly affected services (e.g., services impacted by network
-disruption even without a dedicated FIS action).
-
-#### {Service Name} ({resource_identifier})
-
-| Time (UTC) | Event | Observation |
-|---|---|---|
-| {HH:MM:SS} | {event} | {what was observed at this point} |
-| {HH:MM:SS} | {event} | {observed result / status change} |
-| ... | ... | ... |
-
-**Key Findings:**
-- {finding_1 — what happened and why}
-- {finding_2 — recovery behavior}
-
-(Repeat for each service)
-
-### Application Log Analysis
-
-(Include this section ONLY if `COLLECT_APP_LOGS=true`. Omit entirely if logs were not collected.)
-
-Embed the analysis output from eks-app-log-analysis Step 7 here.
-Use the report structure defined in eks-app-log-analysis SKILL.md:
-Summary table, per-application error timeline, key error patterns,
-log samples, insights, cross-service correlation, and recommendations.
-
-### Recovery Status Summary
-
-| Resource | Recovery Status | Notes |
-|---|---|---|
-| {service} | {Recovered / Partially Recovered / Recovering} | {details} |
-
-### Issues Requiring Attention
-
-#### 1. {Issue title}
-- **Problem:** {description}
-- **Recommendation:** {action to take, with CLI command if applicable}
-
-### Cleanup
-
-{cleanup instructions with CLI commands — reference the stack name for CFN cleanup}
-
-### Appendix: Log File Locations
-
-(Include this section ONLY if `COLLECT_APP_LOGS=true`.)
-
-**Raw log directory:** `{LOG_DIR}`
-
-| Application | Log File |
-|---|---|
-| {namespace/deployment} | `{LOG_DIR}/{service}/{deployment}.log` |
-```
-
-After saving the file, print a brief summary to the terminal listing only:
-- The file path of the saved results report
-- Experiment ID and final status
-- Start time, end time, and duration (all timestamps in ISO 8601 with timezone)
-- Experiment type (POD / NON-POD)
+After saving, print a brief terminal summary:
+- File path, experiment ID, final status
+- Start/end time and duration (ISO 8601 with timezone)
 - Per-action status (one line each)
 - Per-service recovery status (one line each)
-- Application log summary — total errors per app, one line each (**only if `COLLECT_APP_LOGS=true`**)
+- Application log summary — total errors per app (or "N/A — kubectl not available")
 - Issues requiring attention (if any)
 - Cleanup instructions
 
@@ -503,10 +320,7 @@ After saving the file, print a brief summary to the terminal listing only:
 
 ## Cleanup Guide
 
-After the experiment, offer cleanup. See `references/cli-commands.md` for cleanup commands.
-
-- **CFN Cleanup (Recommended):** Delete the stack to remove all resources
-- **Manual Cleanup:** Delete individual resources if they exist outside the stack
+After the experiment, offer cleanup. See `references/cli-commands.md` for commands.
 
 ## Error Handling
 

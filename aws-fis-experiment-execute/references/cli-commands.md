@@ -184,18 +184,28 @@ aws fis list-experiments \
 ```bash
 EXPERIMENT_ID="{EXPERIMENT_ID}"
 REGION="{REGION}"
+MAX_POLL=30  # max 30 polls × 30s = 15 minutes
+POLL_COUNT=0
 
-while true; do
+while [ $POLL_COUNT -lt $MAX_POLL ]; do
   STATUS=$(aws fis get-experiment \
     --id "${EXPERIMENT_ID}" \
     --region ${REGION} \
-    --query 'experiment.state.status' --output text)
-  echo "$(date '+%Y-%m-%d %H:%M:%S'): Status = $STATUS"
+    --query 'experiment.state.status' --output text 2>/dev/null)
+  echo "$(TZ=Asia/Shanghai date '+%Y-%m-%d %H:%M:%S'): Status = $STATUS"
+  if [ -z "$STATUS" ] || [ "$STATUS" = "None" ]; then
+    echo "ERROR: Failed to get experiment status (invalid experiment ID or API error)"
+    break
+  fi
   case "$STATUS" in
     completed|stopped|failed) break ;;
-    *) sleep 30 ;;
+    *) POLL_COUNT=$((POLL_COUNT + 1)); sleep 30 ;;
   esac
 done
+
+if [ $POLL_COUNT -ge $MAX_POLL ]; then
+  echo "WARN: Polling timed out after $((MAX_POLL * 30 / 60)) minutes"
+fi
 ```
 
 ### Check Alarm State
@@ -214,8 +224,8 @@ aws cloudwatch get-metric-statistics \
   --namespace "{NAMESPACE}" \
   --metric-name "{METRIC}" \
   --dimensions "Name={DIM_NAME},Value={DIM_VALUE}" \
-  --start-time "$(date -u -v-30M +%Y-%m-%dT%H:%M:%S)" \
-  --end-time "$(date -u +%Y-%m-%dT%H:%M:%S)" \
+  --start-time "$(TZ=UTC date -v-30M +%Y-%m-%dT%H:%M:%S)" \
+  --end-time "$(TZ=UTC date +%Y-%m-%dT%H:%M:%S)" \
   --period 60 \
   --statistics Average \
   --region {REGION} --output table

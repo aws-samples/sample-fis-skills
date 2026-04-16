@@ -16,10 +16,11 @@
 ## 核心功能
 
 1. **双模式运行** — 实验期间实时监控 或 实验后事后分析
-2. **智能依赖发现** — 读取实验上下文，引导用户指定应用与服务的依赖关系
-3. **并行日志收集** — 后台 `kubectl logs -f` 进程同时收集多个应用日志，仅收集常规容器日志（排除 FIS 注入的临时容器）
-4. **实时洞察展示** — 每 30 秒：实际错误日志（5 行）+ 按服务分组的分析洞察
-5. **全面分析报告** — 错误时间线、模式识别、跨服务关联、恢复分析
+2. **多集群深度依赖发现** — 自动发现目标 Region 中所有 EKS 集群，为每个集群生成独立的 kubeconfig 文件（绝不覆盖 `~/.kube/config`），并行扫描所有可访问的集群。深度扫描覆盖 Pod 环境变量、ConfigMap、Secret 键名（仅元数据）、EnvFrom 引用、Service ExternalName、Volume 挂载（projected/CSI）。
+3. **托管服务日志收集** — 自动检测 EKS 控制平面、RDS/Aurora、ElastiCache、MSK、OpenSearch 的 CloudWatch 日志是否开启；已开启的自动查询实验时间窗口内的日志（查询结束时间延长至实验结束后 3 分钟，以捕获恢复基线），与应用层影响交叉关联
+4. **跨集群并行日志收集** — 后台 `kubectl logs -f` 进程同时收集多个集群上多个应用的日志，仅收集常规容器日志（排除 FIS 注入的临时容器）
+5. **实时洞察展示** — 每 30 秒：实际错误日志（5 行）+ 按服务分组的分析洞察
+6. **全面分析报告** — 错误时间线、模式识别、跨服务关联、托管服务日志洞察、恢复分析
 
 ## 工作流程概览
 
@@ -34,11 +35,13 @@
     └── 批量获取历史日志
 
 公共步骤
+├── 发现 Region 内所有 EKS 集群 + 生成独立 kubeconfig
 ├── 从 expected-behavior.md 或报告读取服务列表
-├── 询问用户每个服务依赖的应用
-├── 收集日志（后台流式或批量）
+├── 深度扫描所有集群的应用依赖（env vars、ConfigMap、Secrets、ExternalName 等）
+├── 检测并收集托管服务日志（EKS/RDS/ElastiCache/MSK/OpenSearch）
+├── 跨集群收集应用日志（后台流式或批量）
 ├── 展示洞察（实时）或分析（事后）
-└── 生成分析报告
+└── 生成分析报告（包含托管服务日志关联分析）
 ```
 
 ## 实时展示格式
@@ -64,22 +67,23 @@
 
 生成的报告包含：
 
-- 实验元数据（ID、时间范围、持续时间）
+- 实验元数据（ID、时间范围含 3 分钟实验后基线窗口、持续时间）
 - 汇总表：每个应用的错误数、峰值错误率、恢复时间
 - 按服务分组的应用分析：
   - 错误时间线表
   - 关键错误模式及数量
   - 实际日志样本（5-10 行）
   - 洞察及与故障注入事件的关联
-- 跨服务关联时间线
+- 跨服务关联时间线（包含实验后基线窗口标注，显示实验结束和基线采集时段）
 - 改进建议
 
 ## 前置条件
 
-- **kubectl** — 日志收集。需要有目标 EKS 集群的访问权限。
-- **AWS CLI** — 查询 FIS 实验状态（用于实时模式）。
+- **kubectl** — 日志收集。需要本地安装，每个集群的 kubeconfig 自动生成。
+- **AWS CLI** — 查询 FIS 实验状态、EKS 集群发现、托管服务日志查询。
 - **实验目录** — 上下文来源，来自 aws-fis-experiment-prepare。
 - **实验报告** — 时间范围来源，来自 aws-fis-experiment-execute。
+- **IAM 权限** — 多集群发现需要 `eks:ListClusters`、`eks:DescribeCluster` 权限。
 - （可选）**CloudWatch Container Insights** — 启用后可提供更丰富的 Pod/Node 级别指标用于关联分析。参见 [启用 Container Insights](https://docs.aws.amazon.com/AmazonCloudWatch/latest/monitoring/Container-Insights-setup-EKS-quickstart.html)。
 - （可选）**EKS 控制平面日志** — 启用 API Server、Audit、Scheduler 等日志，用于更深入的分析。参见 [启用控制平面日志](https://docs.aws.amazon.com/eks/latest/userguide/control-plane-logs.html)。
 
@@ -119,15 +123,20 @@
 ## 目录结构
 
 ```
-eks-app-log-analysis/
+app-service-log-analysis/
 ├── SKILL.md          # Skill 主定义文件
 ├── README.md         # 英文文档
-└── README_CN.md      # 本文件（中文）
+├── README_CN.md      # 本文件（中文）
+└── references/
+    ├── managed-service-log-commands.md   # 托管服务日志收集命令
+    └── report-template.md               # 日志分析报告模板
 ```
 
 ## 已知限制
 
-- 需要 kubectl 访问 EKS 集群；不在集群内的日志无法捕获
+- 需要本地安装 kubectl；每个集群的 kubeconfig 自动生成到日志目录
+- 多集群扫描需要 `eks:ListClusters` 和 `eks:DescribeCluster` 权限
+- 私有 EKS 集群可能无法通过 VPN/堡垒机以外的方式访问；不可访问的集群会被跳过
 - 实验期间 Pod 重启可能导致日志间隙（kubectl logs 只显示当前 Pod 日志）
 - FIS pod 级故障注入使用临时容器（ephemeral containers）— 本 skill 明确排除这些容器以避免应用日志中的噪音
 - 对于长时间运行的实验，建议改用 CloudWatch Logs Insights

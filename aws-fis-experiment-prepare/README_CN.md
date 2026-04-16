@@ -26,7 +26,7 @@
 3. **验证兼容性** — 通过 AWS CLI 检查实际资源（如 `describe-db-instances`、`describe-db-clusters`），与 FIS Action 的 `resourceType` 要求交叉校验，在生成任何文件之前完成。
 4. **确定监控配置** — 默认使用 `source: "none"`（不绑定 Stop Condition 告警）。仅在用户明确提供告警时才创建 CloudWatch Alarm。生成包含各服务可用性、性能和错误/延迟指标的综合 CloudWatch Dashboard。
 5. **读取 CFN 资源文档** — 在生成 CFN 模板之前，读取 `AWS::FIS::ExperimentTemplate` CloudFormation 文档，确保模板使用当前的属性 schema。
-6. **生成配置文件** — 生成包含 6 个文件的自包含目录：实验模板、IAM 策略、CFN 模板、告警、Dashboard 和 README。
+6. **生成配置文件** — 生成包含 2 个文件的自包含目录：CFN 模板和 README。
 7. **自动修复部署** — 部署 CFN 模板，若部署失败则自动分析错误、修复模板、删除失败 Stack、重试（最多 5 次）。
 8. **目录重命名追加模版 ID** — 部署成功后，将实验模版 ID 追加到输出目录名（如 `2026-04-11-pod-net-pktloss-payment-redis-EXT1a2b3c4d5e6f7/`），方便用户查找。
 
@@ -52,17 +52,26 @@
 - `aws:elasticache:replicationgroup-interrupt-az-power`
 - `aws:eks:pod-network-latency`
 
+### SSM Automation 故障注入（无原生 FIS Action 的服务）
+
+对于**没有原生 FIS Action** 的 AWS 服务（如 MSK、MQ、Redshift、Neptune、OpenSearch），
+Skill 使用 `aws:ssm:start-automation-execution` 调用 SSM Automation Runbook，
+直接调用目标服务的 API。该方法在单个 CFN Stack 中同时创建 SSM Automation 文档和 FIS 实验模板。
+
+示例：
+- **MSK** — `kafka:RebootBroker` 测试 Kafka 消费者/生产者的弹性
+- **Amazon MQ** — `mq:RebootBroker` 测试 ActiveMQ/RabbitMQ 客户端故障转移
+- **Redshift** — `redshift:RebootCluster` 测试数据仓库查询弹性
+- **Neptune** — `neptune:FailoverDBCluster` 测试图数据库客户端故障转移
+
+详见 `references/ssm-automation-generic-api-guide.md`，包含完整的 SSM Automation Runbook 模板、双角色 IAM 设计和 CFN 集成方式。
+
 ## 输出目录结构
 
 ```
 ./{yyyy-mm-dd-HH-MM-SS}-{scenario-slug}-{target-slug}[-{context-slug}]-{TEMPLATE_ID}/
 ├── README.md                          # 实验概览和执行说明
-├── experiment-template.json           # FIS 实验模板（CLI 创建用）
-├── iam-policy.json                    # 最小权限 IAM 策略
-├── cfn-template.yaml                  # 全包 CloudFormation 模板
-└── alarms/
-    ├── stop-condition-alarms.json     # CloudWatch 告警定义
-    └── dashboard.json                 # CloudWatch Dashboard 定义
+└── cfn-template.yaml                  # 全包 CloudFormation 模板
 ```
 
 可选的 `{context-slug}` 用于区分相同场景和 target 但不同下游服务的实验
@@ -169,8 +178,13 @@ aws cloudformation deploy \
 "Prepare an AZ Power Interruption experiment for us-east-1a"
 "Create FIS experiment for aws:rds:failover-db-cluster targeting my Aurora cluster"
 "准备 FIS 实验，测试 AZ 断电对 EKS 和 RDS 的影响"
+"测试 AZ 断电对 RDS 的影响"
 "生成 EC2 CPU 压力测试的混沌实验配置"
 "为 ap-southeast-1 的 ElastiCache 故障转移配置故障注入测试"
+"只测试 AZ 断电对 EC2 和 ElastiCache 的影响"
+"重启 MSK broker，测试 Kafka 消费者的弹性"
+"准备 MSK broker 重启的故障注入实验"
+"创建 Neptune 集群故障转移的 FIS 实验"
 ```
 
 ## 关键设计决策
@@ -183,13 +197,21 @@ aws cloudformation deploy \
 
 4. **全包 CFN 模板。** `cfn-template.yaml` 包含 IAM 角色、告警、Dashboard 和实验模板。一次 `cloudformation deploy` 即可完成所有部署。
 
-5. **本地文件保持同步。** 部署成功后，`experiment-template.json` 和 `README.md` 会用真实 ARN 和 Stack 输出更新，使目录成为已部署实验的准确记录。
+5. **本地文件保持同步。** 部署成功后，`README.md` 会用真实 ARN 和 Stack 输出更新，使目录成为已部署实验的准确记录。
 
 6. **绝不启动实验。** 本 Skill 只准备和部署基础设施。启动实际实验由 [aws-fis-experiment-execute](../aws-fis-experiment-execute/) 或用户手动完成。
 
 7. **目录名包含实验模版 ID。** 部署成功后，输出目录名自动追加实验模版 ID（如 `EXT1a2b3c4d5e6f7`），用户可以直接通过目录名识别对应的实验模版。
 
 8. **EKS RBAC 通过 CFN Custom Resource 管理。** EKS Pod Action 所需的 K8s RBAC 资源（ServiceAccount、Role、RoleBinding）由 Lambda-backed CFN Custom Resource 自动管理。使用固定标准化名称（`fis-sa`、`fis-experiment-role`、`fis-experiment-role-binding`），同一 namespace 下所有实验共享。Lambda 执行幂等创建（已存在则跳过），删除 Stack 时不会删除 RBAC 资源，因为其他实验可能仍在使用。Lambda 使用 `botocore.signers.RequestSigner` 并携带 `x-k8s-aws-id` header 生成 EKS bearer token，这是 EKS API server 正确认证所必需的。
+
+9. **AZ 电力中断：每个 AZ 一个 Stack，标签共享。** 目标 AZ 在实验模板的多个位置写死（filter、action 参数）。要测试不同 AZ 需删除 Stack 重建。资源标签（`AzImpairmentPower`）不区分 AZ — 由实验模板内部的 AZ filter 处理。标签通过同一 CFN Stack 中的 Lambda-backed Custom Resource 打上，EC2 Instance Profile 无需额外权限。详见 `references/az-power-interruption-guide.md`。
+
+10. **AZ 电力中断：按服务范围裁剪子动作。** 当用户提到特定服务（如"测试 AZ 断电对 RDS 的影响"），实验模板仅包含与该服务相关的子动作，而非全部 10 个子动作。这可以防止对同一 AZ 中其他业务应用的意外影响。强制性基础设施子动作（网络中断、ARC Zonal Autoshift）始终包含，除非用户明确排除。Agent 在生成文件前会与用户确认最终的子动作列表。
+
+11. **默认实验持续时间为 10 分钟。** 所有实验场景和子动作的默认持续时间为 `PT10M`，除非用户另行指定。这比 AWS 文档默认的 `PT30M` 更短，但对大多数验证场景已经足够，同时缩短了影响范围窗口。时间相关参数（如 ARC Zonal Autoshift 时间）按比例调整。
+
+12. **SSM Automation 支持无原生 FIS Action 的服务。** 对于没有原生 FIS Action 的 AWS 服务（MSK、MQ、Redshift、Neptune、OpenSearch 等），Skill 使用 `aws:ssm:start-automation-execution` 调用 SSM Automation Runbook，直接调用目标服务的 API（如 `kafka:RebootBroker`）。这需要双角色 IAM 模式：FIS 实验角色（信任 `fis.amazonaws.com`）将 SSM Automation 角色（信任 `ssm.amazonaws.com`）传递给 SSM，后者拥有目标服务的权限。SSM 文档和 FIS 实验模板都在单个 CFN Stack 中部署。详见 `references/ssm-automation-generic-api-guide.md`。
 
 ## 目录结构
 
@@ -200,8 +222,9 @@ aws-fis-experiment-prepare/
 ├── README_CN.md                          # 本文件（中文版）
 └── references/
     ├── output-structure.md               # 6 个输出文件的格式规范
-    ├── scenario-templates.md             # FIS Scenario Library JSON 模板示例
-    └── eks-pod-action-prerequisites.md   # EKS Pod Action 前置条件（Lambda + Custom Resource 管理 K8s RBAC）
+    ├── eks-pod-action-prerequisites.md   # EKS Pod Action 前置条件（Lambda + Custom Resource 管理 K8s RBAC）
+    ├── az-power-interruption-guide.md    # AZ 电力中断场景指南（标签策略、权限、设计决策）
+    └── ssm-automation-generic-api-guide.md  # SSM Automation 通用 API 故障注入指南（MSK、MQ、Redshift、Neptune 等无原生 FIS Action 的服务）
 ```
 
 ## 已知限制

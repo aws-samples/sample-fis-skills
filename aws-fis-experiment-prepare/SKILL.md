@@ -70,6 +70,17 @@ Determine whether the user wants a **Scenario Library** pre-built scenario or a
 - User specifies an action ID like `aws:rds:failover-db-cluster`
 - Or describes what they want to test and you map it to an action
 
+**SSM Automation-based fault injection** (for services without native FIS actions):
+- When the target service has **no native FIS action** (e.g., MSK, MQ, Redshift,
+  Neptune, OpenSearch), use `aws:ssm:start-automation-execution` to invoke an SSM
+  Automation runbook that calls the target service's API directly
+- The user describes what they want to test (e.g., "reboot MSK broker", "failover
+  Neptune cluster") and the skill creates both the SSM Automation document and the
+  FIS experiment template in a single CFN stack
+- **MANDATORY:** Follow `references/ssm-automation-generic-api-guide.md` for the
+  full pattern including the two-role IAM design, runbook template, and CFN
+  integration
+
 If ambiguous, ask the user to clarify.
 
 #### Region Detection
@@ -81,6 +92,22 @@ Same as aws-service-chaos-research — use this order:
 4. Ask the user
 
 Store as `TARGET_REGION`.
+
+#### Default Experiment Duration
+
+**Default duration: `PT10M` (10 minutes)** for all experiment scenarios and sub-actions,
+unless the user explicitly specifies a different duration.
+
+The original AWS documentation templates for Scenario Library scenarios use `PT30M`
+(30 minutes), but 10 minutes is sufficient for most validation scenarios and reduces
+the blast radius window. When using `PT10M`:
+- Apply `PT10M` to all sub-actions' `parameters.duration` fields
+- For AZ Power Interruption, scale the ARC Zonal Autoshift timing proportionally:
+  at `PT10M`, ARC starts at minute 2 (`startAfter` the initial actions) and runs for
+  8 minutes (instead of starting at minute 5 and running for 25 minutes at `PT30M`)
+
+If the user provides a custom duration, apply it consistently to all sub-actions and
+adjust any time-dependent parameters proportionally.
 
 ### Step 2: Discover Target Resources
 
@@ -131,7 +158,26 @@ do NOT add `filters` (e.g., AZ filter) to the same target — FIS will reject it
 either:
 - Use `resourceArns` with only the specific ARNs in the target AZ (preferred), or
 - Use `resourceTags` + `filters` together (fallback)
-4. Cross-reference with `references/scenario-templates.md` for additional skeleton context
+4. **If scenario is AZ Power Interruption**, you MUST also follow
+   `references/az-power-interruption-guide.md` — it covers **service-scoped sub-action
+   pruning** (blast radius control), default experiment duration, tagging strategy
+   (Custom Resource Lambda), FIS Experiment Role permissions (managed policies + inline),
+   CFN Service Role prerequisites (`logs:*`, `iam:CreateServiceLinkedRole`), IAM Role
+   target for Pause Instance Launches, and the design decision of one Stack per AZ.
+
+   **Service-Scoped Sub-Action Pruning (CRITICAL):**
+   - When the user mentions **specific services** (e.g., "test AZ failure for RDS",
+     "AZ 断电对 ElastiCache 的影响"), include ONLY the sub-actions relevant to those
+     services plus the mandatory infrastructure sub-action (Pause-Network-Connectivity).
+     ARC Zonal Autoshift is only included if the user's environment has resources with
+     zonal autoshift enabled. **Remove all other sub-actions** to prevent unintended
+     impact on other business applications.
+   - When the user says "all services" or does not specify services, include all
+     sub-actions (full AZ power interruption).
+   - **Always confirm the final sub-action list with the user** before generating files.
+   - See `references/az-power-interruption-guide.md` → "Service-Scoped Sub-Action
+     Pruning" section for the complete mapping table, dependency rules, and examples.
+
 5. Proceed to resource discovery and compatibility validation as normal
 
 From the documentation, extract:
@@ -141,12 +187,20 @@ From the documentation, extract:
 
 **Ask the user:**
 1. Which AZ to target (for AZ-level scenarios)
-2. Target resource identifiers:
+2. **Which services to include in the experiment** (for AZ Power Interruption):
+   - If the user mentions specific services (e.g., "RDS", "EC2 and ElastiCache"),
+     include ONLY those services' sub-actions + mandatory infrastructure sub-actions
+   - If the user does not specify services, ask: "Do you want to test all services
+     (full AZ power interruption) or only specific services? Including all services
+     will affect EC2, ASG, RDS, ElastiCache, EBS, S3 Express, and network connectivity
+     in the target AZ."
+   - Present the final sub-action list and ask for confirmation before proceeding
+3. Target resource identifiers:
    - For RDS/Aurora: cluster identifiers or instance identifiers
    - For EC2: instance IDs or ASG names
    - For ElastiCache: replication group IDs
    - For EKS: cluster name, namespace, pod labels
-3. Use the identifiers to discover the actual resource ARNs via AWS CLI, then populate
+4. Use the identifiers to discover the actual resource ARNs via AWS CLI, then populate
    `resourceArns` in the experiment template targets
 
 #### For Custom FIS Actions
@@ -160,6 +214,32 @@ Extract from the action:
 - Required `targets` (resource types, e.g., `aws:rds:cluster`, `aws:ec2:instance`)
 - Required `parameters` (duration, percentage, etc.)
 - Ask the user for target resource identifiers, then resolve to ARNs via AWS CLI
+
+#### For Services Without Native FIS Actions (SSM Automation)
+
+If `aws fis list-actions` has no native action for the user's target service:
+
+1. **Confirm no native action exists:**
+   ```bash
+   aws fis list-actions --query "actions[?starts_with(id, 'aws:{SERVICE}:')]" \
+     --region TARGET_REGION --output table
+   ```
+
+2. **If no results, use the SSM Automation approach.** Follow
+   `references/ssm-automation-generic-api-guide.md` to:
+   - Identify the target service's API operation (e.g., `kafka:RebootBroker`)
+   - Create an SSM Automation runbook (schema 0.3) with `aws:executeAwsApi`
+   - Deploy the runbook as `AWS::SSM::Document` in the CFN template
+   - Wire it into the FIS experiment template via `aws:ssm:start-automation-execution`
+   - Create the two-role IAM pattern (FIS Experiment Role + SSM Automation Role)
+
+3. **Resource discovery:** Use the target service's CLI to discover resources:
+   - MSK: `aws kafka list-clusters`, `aws kafka list-nodes`
+   - MQ: `aws mq list-brokers`
+   - Redshift: `aws redshift describe-clusters`
+   - Neptune: `aws neptune describe-db-clusters`
+
+4. Proceed to Step 3 (compatibility validation) as normal.
 
 ### Step 2.5: EKS Pod Action Prerequisites (Mandatory Gate)
 
@@ -328,11 +408,14 @@ digraph compat_check {
 
 #### 3d. For Scenario Library Scenarios
 
-For composite scenarios (e.g., AZ Power Interruption), validate EACH sub-action
-against its respective target resources. For example:
+For composite scenarios (e.g., AZ Power Interruption), validate EACH **included**
+sub-action against its respective target resources. For example:
 - RDS sub-action: verify the user's RDS resource is actually an Aurora cluster
 - ElastiCache sub-action: verify the user's cache is a replication group
 - EC2 sub-action: verify instances exist in the target AZ
+
+**Only validate sub-actions that are included after service-scoped pruning.** If the
+user only requested RDS impact, do not validate EC2 or ElastiCache resources.
 
 Sub-actions with no matching resources are automatically skipped by FIS (this is
 fine), but if the user's **primary** resource fails validation, stop and report.
@@ -349,8 +432,7 @@ the experiment run to completion.
 
 If the user explicitly provides a CloudWatch Alarm ARN or asks to set up a stop
 condition alarm, then use `source: "aws:cloudwatch:alarm"` with the alarm ARN. In
-that case, also create the alarm resource in the CFN template and the
-`alarms/stop-condition-alarms.json` file.
+that case, also create the alarm resource in the CFN template.
 
 **Reference — useful alarm metrics if the user wants stop conditions:**
 
@@ -401,7 +483,7 @@ TARGET_SLUG=$(echo "TARGET_RESOURCE_ID" | tr '[:upper:]' '[:lower:]' | tr ' :/' 
 #     e.g., "redis", "msk", "dynamo", "rds" (inferred from port, endpoint, or user description)
 #   - Other actions: omit unless user specifies a distinguishing purpose
 CONTEXT_SLUG=$(echo "CONTEXT_NAME" | tr '[:upper:]' '[:lower:]' | tr ' :/' '-' | cut -c1-10)
-TIMESTAMP=$(date +%Y-%m-%d-%H-%M-%S)
+TIMESTAMP=$(TZ=Asia/Shanghai date +%Y-%m-%d-%H-%M-%S)
 # Include CONTEXT_SLUG only when it is set (non-empty)
 if [ -n "${CONTEXT_SLUG}" ]; then
   OUTPUT_DIR="./${TIMESTAMP}-${SCENARIO_SLUG}-${TARGET_SLUG}-${CONTEXT_SLUG}"
@@ -436,6 +518,10 @@ while remaining readable. Max 18 characters.
 | `aws:elasticache:replicationgroup-interrupt-az-power` | `ec-rg-az-power` | 14 |
 | `aws:ebs:pause-io` | `ebs-pause-io` | 12 |
 | `aws:ssm:send-command` | `ssm-cmd` | 7 |
+| `aws:ssm:start-automation-execution` (MSK reboot) | `ssm-auto-msk-reboot` | 20→18 |
+| `aws:ssm:start-automation-execution` (MQ reboot) | `ssm-auto-mq-reboot` | 18 |
+| `aws:ssm:start-automation-execution` (Redshift reboot) | `ssm-auto-rs-reboot` | 18 |
+| `aws:ssm:start-automation-execution` (Neptune failover) | `ssm-auto-np-failover` | 20→18 |
 
 **Abbreviation rules for unlisted actions:**
 - `network` → `net`, `packet-loss` → `pktloss`, `memory` → `mem`
@@ -443,6 +529,8 @@ while remaining readable. Max 18 characters.
 - `interruption` → `int`, `slowdown` → `slow`, `connectivity` → `conn`
 - `application` → `app`, `replicationgroup` → `rg`, `elasticache` → `ec`
 - EKS pod actions: keep `pod-` prefix, drop `eks-` (e.g., `pod-net-pktloss` not `eks-net-pktloss`)
+- SSM Automation actions: use `ssm-auto-` prefix + service abbrev + operation (e.g., `ssm-auto-msk-reboot`)
+  - `redshift` → `rs`, `neptune` → `np`, `opensearch` → `os`, `memorydb` → `memdb`
 - Target max 18 characters
 
 **CONTEXT_SLUG guidance:**
@@ -480,17 +568,26 @@ Review the required/optional properties and their types. Pay special attention t
 
 Use the documented property names and structures verbatim when generating the CFN template.
 
+**ALSO REQUIRED:** Search for CloudFormation examples and templates related to the
+resources in this experiment using the `cloudformation` topic:
+
+```
+aws___search_documentation:
+  search_phrase: "<list of CFN resource types in this experiment, e.g. AWS::FIS::ExperimentTemplate AWS::IAM::Role AWS::Lambda::Function Custom Resource>"
+  topics: ["cloudformation"]
+```
+
+This helps catch CFN-specific gotchas (e.g., Custom Resource response handling,
+DependsOn requirements, property format differences between API and CFN) that are
+not covered by reading the FIS resource documentation alone.
+
 Generate files following the templates in `references/output-structure.md`:
 
-1. **experiment-template.json** — FIS experiment template for CLI creation
-2. **iam-policy.json** — IAM permissions needed by the FIS execution role
-3. **cfn-template.yaml** — CloudFormation template containing ALL resources:
+1. **cfn-template.yaml** — CloudFormation template containing ALL resources:
    - IAM Role with **AWS managed policies** as base + inline policy for extras
    - CloudWatch Dashboard (comprehensive per-service metrics)
    - FIS Experiment Template (default `Source: 'none'`)
    - CloudWatch Alarm — **only if user provided a stop condition**
-4. **alarms/stop-condition-alarms.json** — Standalone alarm definitions (**only if user provided a stop condition**; otherwise skip)
-5. **alarms/dashboard.json** — CloudWatch dashboard body
 
 #### FIS Execution Role: Use AWS Managed Policies
 
@@ -521,6 +618,7 @@ experiment. Map FIS actions to managed policies:
 | `aws:ecs:*` | ECSAccess |
 | `aws:eks:*` | EKSAccess |
 | `aws:ssm:*` | SSMAccess |
+| `aws:ssm:start-automation-execution` (generic API) | SSMAccess + `iam:PassRole` (see `references/ssm-automation-generic-api-guide.md`) |
 | `aws:ebs:*` | EC2Access (EBS actions are covered by EC2Access) |
 | `aws:elasticache:*` | *(no managed policy — use inline)* |
 | `aws:s3:*` | *(no managed policy — use inline)* |
@@ -564,7 +662,6 @@ FISExperimentRole:
 6. **README.md** — Experiment overview and execution instructions
 
 See `references/output-structure.md` for exact file formats.
-See `references/scenario-templates.md` for Scenario Library JSON templates.
 
 ### Step 5.5: CloudFormation Permission Pre-Check
 
@@ -775,8 +872,6 @@ digraph cfn_loop {
    | `AccessDenied` | Caller lacks permissions | Check caller's IAM permissions |
 
 3. **Fix `cfn-template.yaml`** in the output directory based on the error analysis.
-   Also update `experiment-template.json` if the fix affects the experiment template
-   structure (e.g., changed action parameters, modified targets).
 
 4. **Delete the failed stack** before retrying:
    ```bash
@@ -811,10 +906,7 @@ After the stack deploys successfully:
      --region ${TARGET_REGION} --output table
    ```
 
-2. **Update `experiment-template.json`** with real ARNs from the stack (role ARN,
-   alarm ARNs) so it stays in sync with what was actually deployed.
-
-3. **Update `README.md`** to include:
+2. **Update `README.md`** to include:
    - The actual stack name (`${STACK_NAME}` — e.g., `fis-az-power-interruption-my-cluster-a3x7k2`)
    - The experiment template ID from stack outputs
    - The CloudWatch dashboard URL from stack outputs
@@ -853,8 +945,9 @@ After:  2026-04-11-10-30-00-pod-net-pktloss-payment-redis-EXT1a2b3c4d5e6f7/
 **Note:** The template ID is already extracted in Step 6d. Reuse the same value here.
 If the CFN deployment failed (Step 6c exceeded max retries), skip this rename step.
 
-After renaming, **update `README.md`** to set the `**Directory:**` field to the final
-directory name (with template ID), e.g., `2026-04-11-10-30-00-pod-net-pktloss-payment-redis-EXT1a2b3c4d5e6f7`.
+After renaming, **update `README.md`** to set the `**Directory:**` field to the full
+absolute path of the final directory (with template ID), e.g.,
+`/home/user/experiments/2026-04-11-10-30-00-pod-net-pktloss-payment-redis-EXT1a2b3c4d5e6f7`.
 
 After renaming, print a brief summary to the terminal listing only:
 - The experiment output directory path (with template ID)
@@ -903,9 +996,9 @@ After renaming, print a brief summary to the terminal listing only:
 - **Sequential MCP calls.** All `aws___read_documentation` and
   `aws___search_documentation` calls must be sequential, never parallel.
   Retry up to 10 times on rate limit errors.
-- **Keep local files in sync.** After successful deployment, update local files
-  (experiment-template.json, README.md) with real ARNs and stack outputs so the
-  directory is a complete, accurate record of the deployed experiment.
+- **Keep local files in sync.** After successful deployment, update README.md
+  with real ARNs and stack outputs so the directory is a complete, accurate record
+  of the deployed experiment.
 - **Pod memory stress requires threshold calculation.** For `aws:eks:pod-memory-stress`,
   the user's percentage is the **total Pod memory target**, not the injection value.
   You MUST query current pod memory usage and subtract it from the target to get the
