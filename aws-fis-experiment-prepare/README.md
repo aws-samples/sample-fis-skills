@@ -23,12 +23,12 @@ Preparing an AWS FIS experiment manually involves several error-prone, tedious s
    - [Cross-AZ Traffic Slowdown](https://docs.aws.amazon.com/en_us/fis/latest/userguide/cross-az-traffic-slowdown-scenario.html)
    - [Cross-Region Connectivity](https://docs.aws.amazon.com/en_us/fis/latest/userguide/cross-region-scenario.html)
 3. **Discovers target resources** — Queries the user's actual AWS resources and collects target identifiers.
-3. **Validates compatibility** — Inspects actual resources via AWS CLI (e.g., `describe-db-instances`, `describe-db-clusters`) and cross-checks against FIS action `resourceType` requirements before generating any files.
-4. **Determines monitoring configuration** — Defaults to `source: "none"` (no stop condition alarm). Only creates CloudWatch alarms if the user explicitly provides one. Generates a comprehensive CloudWatch dashboard with per-service availability, performance, and error/latency metrics.
-5. **Reads CFN resource documentation** — Before generating the CFN template, reads the `AWS::FIS::ExperimentTemplate` CloudFormation documentation to ensure the template uses the current property schema.
-6. **Generates configuration files** — Produces a self-contained directory with 2 files: CFN template and README.
-7. **Deploys with self-healing** — Deploys the CFN template, and if deployment fails, automatically analyzes errors, fixes the template, deletes the failed stack, and retries (up to 5 times).
-8. **Renames directory with template ID** — After successful deployment, appends the experiment template ID to the output directory name (e.g., `2026-04-11-pod-net-pktloss-payment-redis-EXT1a2b3c4d5e6f7/`) for easy identification.
+4. **Validates compatibility** — Inspects actual resources via AWS CLI (e.g., `describe-db-instances`, `describe-db-clusters`) and cross-checks against FIS action `resourceType` requirements before generating any files.
+5. **Determines monitoring configuration** — Defaults to `source: "none"` (no stop condition alarm). Only creates CloudWatch alarms if the user explicitly provides one. Generates a comprehensive CloudWatch dashboard with per-service availability, performance, and error/latency metrics.
+6. **Reads CFN resource documentation** — Before generating the CFN template, reads the `AWS::FIS::ExperimentTemplate` CloudFormation documentation to ensure the template uses the current property schema.
+7. **Generates configuration files** — Produces a self-contained directory with 2 files: CFN template and README.
+8. **Deploys with self-healing** — Deploys the CFN template, and if deployment fails, automatically analyzes errors, fixes the template, deletes the failed stack, and retries (up to 5 times).
+9. **Renames directory with template ID** — After successful deployment, appends the experiment template ID to the output directory name (e.g., `2026-04-11-pod-net-pktloss-payment-redis-EXT1a2b3c4d5e6f7/`) for easy identification.
 
 ## Supported Scenarios
 
@@ -52,17 +52,15 @@ Any valid FIS action ID, e.g.:
 - `aws:elasticache:replicationgroup-interrupt-az-power`
 - `aws:eks:pod-network-latency`
 
-### SSM Automation-Based Fault Injection (Services Without Native FIS Actions)
+### Service-Specific Guides (SSM Automation for Services Without Native FIS Actions)
 
-For AWS services that have **no native FIS action** (e.g., MSK, MQ, Redshift, Neptune, OpenSearch), the skill uses `aws:ssm:start-automation-execution` to invoke an SSM Automation runbook that calls the target service's API directly. This approach creates both the SSM Automation document and the FIS experiment template in a single CFN stack.
+For AWS services that have **no native FIS action**, the skill uses `aws:ssm:start-automation-execution` to invoke an SSM Automation runbook that calls the target service's API directly. Both the SSM Automation document and the FIS experiment template are deployed in a single CFN stack.
 
-Examples:
-- **MSK** — `kafka:RebootBroker` to test Kafka consumer/producer resilience
-- **Amazon MQ** — `mq:RebootBroker` to test ActiveMQ/RabbitMQ client failover
-- **Redshift** — `redshift:RebootCluster` to test data warehouse query resilience
-- **Neptune** — `neptune:FailoverDBCluster` to test graph database client failover
+Currently supported:
+- **Amazon MSK** — `kafka:RebootBroker` to test Kafka consumer/producer resilience. See `references/msk-guide.md`.
+- **Amazon ElastiCache** (primary node reboot) — `elasticache:RebootCacheCluster` to test Redis/Valkey connection pool and retry logic resilience. See `references/elasticache-redis-guide.md`.
 
-See `references/ssm-automation-generic-api-guide.md` for the full pattern, including SSM Automation runbook templates, two-role IAM design, and CFN integration.
+Additional services (Redshift, Neptune, OpenSearch, MemoryDB, etc.) can be added following the same pattern — the `ssm-auto-<service>-<operation>` slug naming and two-role IAM design are documented in `references/slug-conventions.md` and `references/msk-guide.md`.
 
 ## Output Directory Structure
 
@@ -80,8 +78,8 @@ The `{TEMPLATE_ID}` is the FIS experiment template ID (e.g., `EXT1a2b3c4d5e6f7`)
 after successful CFN deployment for easy identification.
 
 Scenario slugs use standard abbreviations (e.g., `pod-net-pktloss`, `az-power-int`,
-`ec-rg-az-power`) to keep CFN stack names and resource names concise. See SKILL.md Step 5
-for the full abbreviation table.
+`ec-rg-az-power`) to keep CFN stack names and resource names concise. See
+`references/slug-conventions.md` for the full abbreviation table and naming rules.
 
 ## Resource-Action Compatibility Validation
 
@@ -112,7 +110,7 @@ After generating files, the skill immediately deploys the CloudFormation templat
 
 - **AWS CLI** (`aws`) — Resource discovery, FIS action validation, CFN deployment. Must have permissions for FIS, IAM, CloudWatch, CloudFormation.
 - [**aws-knowledge-mcp-server**](https://github.com/awslabs/mcp/tree/main/src/aws-knowledge-mcp-server) — Scenario Library documentation research (`aws___search_documentation`, `aws___read_documentation`)
-- **jq** — JSON processing (optional but recommended)
+- **jq** — JSON processing (required by scripts in `scripts/`)
 
 **EKS Pod fault injection prerequisites:**
 - EKS cluster authentication mode must be **`API_AND_CONFIG_MAP`** or **`API`**
@@ -122,7 +120,7 @@ After generating files, the skill immediately deploys the CloudFormation templat
 - The CFN template includes a Lambda function that performs idempotent creation of K8s RBAC resources (checks if they exist before creating). The Lambda uses `botocore.signers.RequestSigner` with `x-k8s-aws-id` header for EKS token generation — this is required for EKS API server authentication (plain `sts_client.generate_presigned_url` lacks this header and results in 401 Unauthorized). The `ensure_resource` helper includes logging and error checking to prevent silent failures.
 - RBAC resources use **fixed standardized names** (`fis-sa`, `fis-experiment-role`, `fis-experiment-role-binding`) shared across all FIS experiments in the same namespace
 - RBAC resources are **not deleted** when a stack is removed — they are shared and may be used by other experiments
-- **MANDATORY:** When using any `aws:eks:pod-*` action, you MUST follow `references/eks-pod-action-prerequisites.md`
+- **MANDATORY:** When using any `aws:eks:pod-*` action, you MUST follow `references/eks-pod-action-guide.md`
 
 ### Create a CloudFormation Service Role
 
@@ -152,7 +150,7 @@ Step 2: Discover target resources
          ├── Scenario Library → MUST read AWS documentation first (JSON templates not available via API)
          └── Custom FIS action → query via `aws fis get-action`
          ↓
-Step 2.5: EKS Pod prerequisites (if applicable)
+Step 2.5: EKS Pod action setup (if applicable)
          └── CFN template auto-includes Lambda + Custom Resource for K8s RBAC management
          ↓
 Step 3: Validate resource-action compatibility [CRITICAL GATE]
@@ -161,7 +159,7 @@ Step 3: Validate resource-action compatibility [CRITICAL GATE]
          ↓
 Step 4: Determine monitoring config (stop conditions + dashboard metrics)
          ↓
-Step 5: Generate 6 configuration files in output directory
+Step 5: Generate configuration files in output directory (README.md + cfn-template.yaml)
          ↓
 Step 5.5: CFN permission pre-check (detect cloudformation:RoleArn condition)
          ↓
@@ -185,7 +183,9 @@ Step 7: Rename output directory (append experiment template ID for easy identifi
 "test AZ failure impact on EC2 and ElastiCache only"
 "Reboot MSK broker to test Kafka consumer resilience"
 "准备 MSK broker 重启的故障注入实验"
-"Create FIS experiment to failover Neptune cluster"
+"Test ElastiCache Redis failover in us-west-2a"
+"Reboot Redis primary node to test connection pool resilience"
+"准备 ElastiCache Redis 主节点重启的实验"
 ```
 
 ## Key Design Decisions
@@ -214,7 +214,7 @@ Step 7: Rename output directory (append experiment template ID for easy identifi
 
 12. **Default experiment duration is 10 minutes.** All experiment scenarios and sub-actions default to `PT10M` unless the user specifies otherwise. This is shorter than the AWS documentation default of `PT30M` but sufficient for most validation scenarios, and reduces the blast radius window. Time-dependent parameters (e.g., ARC Zonal Autoshift timing) scale proportionally.
 
-13. **SSM Automation for unsupported services.** For AWS services without native FIS actions (MSK, MQ, Redshift, Neptune, OpenSearch, etc.), the skill uses `aws:ssm:start-automation-execution` to invoke an SSM Automation runbook that calls the target service's API directly (e.g., `kafka:RebootBroker`). This requires a two-role IAM pattern: the FIS Experiment Role (trusts `fis.amazonaws.com`) passes an SSM Automation Role (trusts `ssm.amazonaws.com`) that has the target service permissions. Both the SSM document and the FIS experiment template are deployed in a single CFN stack. See `references/ssm-automation-generic-api-guide.md` for full details.
+13. **Service-specific guides for services without native FIS actions.** Amazon MSK has no native FIS action, so the skill uses `aws:ssm:start-automation-execution` to invoke an SSM Automation runbook that calls `kafka:RebootBroker` directly. This requires a two-role IAM pattern: the FIS Experiment Role (trusts `fis.amazonaws.com`) passes an SSM Automation Role (trusts `ssm.amazonaws.com`) that has the MSK API permissions. Both the SSM document and the FIS experiment template are deployed in a single CFN stack. See `references/msk-guide.md` for full details. Additional services (Redshift, Neptune, OpenSearch, etc.) can be added as separate service-specific guides following the same pattern.
 
 ## Directory Structure
 
@@ -223,11 +223,18 @@ aws-fis-experiment-prepare/
 ├── SKILL.md                              # Main skill definition (agent instructions)
 ├── README.md                             # This file (English)
 ├── README_CN.md                          # Chinese version
-└── references/
-    ├── output-structure.md               # File format specifications for all 6 output files
-    ├── eks-pod-action-prerequisites.md   # EKS Pod action prerequisites (Lambda + Custom Resource for K8s RBAC)
-    ├── az-power-interruption-guide.md    # AZ Power Interruption scenario guide (tagging, permissions, design decisions)
-    └── ssm-automation-generic-api-guide.md  # SSM Automation approach for services without native FIS actions (MSK, MQ, Redshift, Neptune, etc.)
+├── references/
+│   ├── output-format.md                  # Directory layout, slug naming, README template
+│   ├── cfn-base-template.md              # CFN skeleton (Parameters, IAM Role, Dashboard, FIS Template, Outputs)
+│   ├── slug-conventions.md               # Scenario/context slug abbreviations, resource naming, length budget
+│   ├── eks-pod-action-guide.md           # EKS Pod action guide (Lambda + Custom Resource for K8s RBAC, auth mode, memory stress calculation)
+│   ├── az-power-interruption-guide.md    # AZ Power Interruption scenario guide (tagging, permissions, design decisions)
+│   ├── elasticache-redis-guide.md        # ElastiCache Redis/Valkey guide (native AZ power action + primary node reboot via SSM)
+│   └── msk-guide.md                      # Amazon MSK FIS experiment guide (broker reboot via SSM Automation)
+└── scripts/
+    ├── precheck-cfn-permissions.sh       # Detects required CFN service role
+    ├── deploy-with-retry.sh              # Validate + deploy + delete-on-failure
+    └── rename-output-dir.sh              # Appends FIS template ID to directory name
 ```
 
 ## Limitations

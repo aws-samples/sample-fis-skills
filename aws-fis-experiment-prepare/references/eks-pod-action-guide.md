@@ -1,8 +1,25 @@
-# EKS Pod Action Prerequisites Reference
+# EKS Pod Action Guide
+
+## Contents
+
+- Scope (which actions this applies to)
+- Official Documentation (required reading)
+- Setup Requirements
+  - 1. Kubernetes RBAC — Managed via CFN Custom Resource (Lambda)
+  - 2. EKS Access Entry (for FIS Experiment Role)
+  - 3. EKS Cluster Authentication Mode
+  - 4. Pod Memory Stress: Threshold Calculation
+  - 5. Pod Security Context
+  - 6. Network Action Limitations
+- Naming Constraints
+- CFN Service Role Permissions
+- IAM Role Name Length
+- CFN Deployment Notes
+- Cleanup
 
 ## Scope
 
-When the FIS action is any of the following types, you **MUST** complete the prerequisite
+When the FIS action is any of the following types, you **MUST** complete the setup
 steps in this document before generating any configuration files:
 
 - `aws:eks:pod-cpu-stress`
@@ -18,7 +35,7 @@ steps in this document before generating any configuration files:
 Before generating any configuration files, you **MUST** call `aws___read_documentation` to read:
 https://docs.aws.amazon.com/fis/latest/userguide/eks-pod-actions.html
 
-## Prerequisites Checklist
+## Setup Requirements
 
 ### 1. Kubernetes RBAC — Managed via CFN Custom Resource (Lambda)
 
@@ -105,7 +122,7 @@ FISRBACLambdaFunction:
     - FISRBACLambdaRole
     - LambdaEKSAccessEntry
   Properties:
-     FunctionName: !Sub 'fis-rbac-${RandomSuffix}'
+    FunctionName: !Sub 'fis-rbac-${RandomSuffix}'
     Runtime: python3.12
     Handler: index.handler
     Role: !GetAtt FISRBACLambdaRole.Arn
@@ -306,12 +323,60 @@ aws eks describe-cluster --name {CLUSTER} \
   --query 'cluster.accessConfig.authenticationMode'
 ```
 
-### 4. Pod Security Context
+### 4. Pod Memory Stress: Threshold Calculation
+
+**When the action is `aws:eks:pod-memory-stress`, you MUST explain to the user
+and calculate the correct `percent` parameter value.**
+
+The `percent` parameter in `aws:eks:pod-memory-stress` represents **additional
+memory to consume on top of existing usage**, NOT the total memory utilization
+target. However, users typically think in terms of "I want the pod's total
+memory to reach X%".
+
+**Workflow:**
+
+1. **Ask the user** for their desired total memory utilization target (e.g.,
+   "80%"). Inform the user: "The percentage you specify is the **total Pod
+   memory threshold** you want to reach, not the additional memory to inject."
+
+2. **Query current memory usage** of the target pod(s):
+   ```bash
+   kubectl top pods -n {NAMESPACE} -l {POD_LABEL_SELECTOR}
+   ```
+   Compare with the pod's memory limit (from `kubectl get pod -o jsonpath` or
+   `kubectl describe pod`) to calculate current utilization percentage.
+
+3. **Calculate the injection value:**
+   ```
+   injection_percent = target_percent - current_usage_percent
+   ```
+   Example: User wants 80% total, current usage is 30% → injection value = 50%
+
+4. **Validate:**
+   - If `injection_percent <= 0`, warn the user: current usage already meets
+     or exceeds the target — no injection needed.
+   - If `injection_percent > 100`, this is invalid — ask the user to verify
+     the target.
+
+5. **Set the parameter** in the experiment template:
+   ```json
+   "parameters": {
+     "duration": "PT5M",
+     "percent": "{injection_percent}"
+   }
+   ```
+
+6. **Include in README.md** the calculation details so the user understands:
+   - Target total memory: X%
+   - Current pod memory usage: Y%
+   - Injected memory stress: X% - Y% = Z%
+
+### 5. Pod Security Context
 
 The target Pod's `readOnlyRootFilesystem` must be `false`. All EKS Pod actions will
 fail if the root filesystem is read-only.
 
-### 5. Network Action Limitations
+### 6. Network Action Limitations
 
 The following actions do NOT support AWS Fargate or bridge network mode:
 - `aws:eks:pod-network-blackhole-port`
@@ -387,7 +452,7 @@ in addition to existing ones:
 The Lambda Execution Role (`FISRBACLambdaRole`) uses `fis-lambda-role-{RandomSuffix}` and
 the FIS Experiment Role (`FISExperimentRole`) uses `fis-role-{RandomSuffix}` — both use
 short prefixes with `RandomSuffix` to stay well within the 64-char IAM role name limit.
-See SKILL.md Step 6b for the full naming table.
+See `references/slug-conventions.md` for the full naming table.
 
 ## CFN Deployment Notes
 

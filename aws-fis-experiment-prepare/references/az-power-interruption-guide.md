@@ -1,5 +1,26 @@
 # AZ Availability: Power Interruption — Scenario Guide
 
+## Contents
+
+- Scope
+- Service-Scoped Sub-Action Pruning (Blast Radius Control)
+  - Pruning Rules
+  - Sub-Action to Service Mapping
+  - Dependency Rules Between Sub-Actions
+  - Examples
+  - Impact on Tagging, Permissions, and Dashboard
+- Default Experiment Duration
+- Official Documentation (Required Reading)
+- Design Decision: One Stack Per AZ
+- Resource Tagging Strategy (Lambda Custom Resource + tag key/value table)
+- FIS Experiment Role — Required Permissions
+- Service-Linked Role (ARC Zonal Autoshift)
+- Pause Instance Launches — Default: Remove
+- Limitations
+- Additional Sub-Action Details (S3 Express, ARC Zonal Autoshift timing)
+- Custom Resource Lambda — Tagging Logic (cfn-response callback, ASG two-step)
+- Quick Reference: CFN Stack Contents
+
 ## Scope
 
 This guide applies when the user requests an **AZ Availability: Power Interruption**
