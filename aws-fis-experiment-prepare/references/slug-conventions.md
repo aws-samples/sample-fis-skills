@@ -39,6 +39,7 @@ remaining readable. **Max 18 characters.**
 | `aws:ssm:send-command` | `ssm-cmd` | 7 |
 | `aws:ssm:start-automation-execution` (MSK reboot) | `ssm-auto-msk-reboot` | 20 |
 | `aws:ssm:start-automation-execution` (ElastiCache reboot) | `ssm-auto-ec-reboot` | 19 |
+| `aws:ssm:start-automation-execution` (ElastiCache failover) | `ssm-auto-ec-failover` | 21 |
 
 ## Abbreviation Rules for Unlisted Actions
 

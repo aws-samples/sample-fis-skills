@@ -11,7 +11,7 @@ description: >
   Cross-Region Connectivity), custom single FIS actions
   (aws:rds:failover-db-cluster, aws:ec2:stop-instances, etc.), and SSM
   Automation-based fault injection for Amazon MSK (broker reboot) and
-  ElastiCache Redis/Valkey (primary node reboot).
+  ElastiCache Redis/Valkey (primary node reboot, replication group failover).
 ---
 
 # AWS FIS Experiment Prepare
@@ -40,8 +40,8 @@ files. Never deliver untested configuration — deploy and self-heal first.
 - `references/eks-pod-action-guide.md` — any `aws:eks:pod-*` action
   (RBAC Lambda, EKS Access Entry, Pod memory stress calculation)
 - `references/elasticache-redis-guide.md` — ElastiCache Redis/Valkey
-  (native AZ power interruption, or primary node reboot via SSM
-  Automation)
+  (native AZ power interruption, primary node reboot via SSM
+  Automation, or replication group failover via SSM Automation)
 - `references/msk-guide.md` — Amazon MSK (broker reboot via SSM
   Automation — no native FIS action exists)
 
@@ -92,7 +92,7 @@ If `CONFIG_MAP` only, the user must update the cluster first.
 | Scenario Library | AZ Power Interruption, AZ App Slowdown, Cross-AZ/Region scenarios | Read AWS doc URL (table below) |
 | Custom FIS action | User specifies an action ID or describes a single fault | — |
 | Custom FIS action (ElastiCache) | ElastiCache AZ power interruption or Redis/Valkey failover | `references/elasticache-redis-guide.md` |
-| SSM Automation | Target service has no native FIS action (MSK, ElastiCache primary reboot) | `references/msk-guide.md` or `references/elasticache-redis-guide.md` |
+| SSM Automation | Target service has no native FIS action (MSK, ElastiCache primary reboot, ElastiCache failover) | `references/msk-guide.md` or `references/elasticache-redis-guide.md` |
 
 If ambiguous, ask the user.
 
@@ -178,8 +178,11 @@ identifiers to ARNs via AWS CLI.
 
 **Special case — ElastiCache:** Has a native FIS action for AZ-level impact
 (`aws:elasticache:replicationgroup-interrupt-az-power`) but **no native
-action for single-node reboot**. For primary node reboot, use SSM
-Automation per `references/elasticache-redis-guide.md` → Scenario 2.
+action for single-node reboot or replication group failover**. For primary
+node reboot, use SSM Automation per
+`references/elasticache-redis-guide.md` → Scenario 2. For replication group
+failover (TestFailover), use SSM Automation per
+`references/elasticache-redis-guide.md` → Scenario 3.
 
 3. Discover resources via the target service's CLI (`aws kafka list-clusters`,
    etc.).
@@ -277,7 +280,7 @@ Include only services actually affected by the experiment.
 | EC2 | `StatusCheckFailed`, `CPUUtilization`, `NetworkIn/Out`, `NetworkPacketsIn/Out` |
 | RDS/Aurora | `DatabaseConnections`, `ReadLatency`, `WriteLatency`, `AuroraReplicaLag`, `FreeableMemory` |
 | EKS | `pod_number_of_running_pods`, `pod_number_of_container_restarts`, `node_cpu_utilization`, `node_memory_utilization` |
-| ElastiCache | `ReplicationLag`, `EngineCPUUtilization`, `CurrConnections`, `CacheHitRate`, `Evictions` |
+| ElastiCache | `ReplicationLag`, `EngineCPUUtilization`, `CurrConnections`, `CacheHitRate`, `Evictions`, `IsMaster` |
 | ALB | `HealthyHostCount`, `UnHealthyHostCount`, `HTTPCode_ELB_5XX_Count`, `TargetResponseTime` |
 | NLB | `ActiveFlowCount`, `TCP_Client_Reset_Count`, `TCP_Target_Reset_Count` |
 

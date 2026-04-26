@@ -22,7 +22,7 @@ Preparing an AWS FIS experiment manually involves several error-prone, tedious s
    - [AZ Application Slowdown](https://docs.aws.amazon.com/en_us/fis/latest/userguide/az-application-slowdown-scenario.html)
    - [Cross-AZ Traffic Slowdown](https://docs.aws.amazon.com/en_us/fis/latest/userguide/cross-az-traffic-slowdown-scenario.html)
    - [Cross-Region Connectivity](https://docs.aws.amazon.com/en_us/fis/latest/userguide/cross-region-scenario.html)
-3. **Discovers target resources** — Queries the user's actual AWS resources and collects target identifiers.
+3. **Discovers target resources** — Queries the user's actual AWS resources and collects target identifiers. For ElastiCache cluster-mode-enabled replication groups, detects shard primary/replica distribution via CloudWatch `IsMaster` metric (since `CurrentRole` returns null for cluster-mode-enabled).
 4. **Validates compatibility** — Inspects actual resources via AWS CLI (e.g., `describe-db-instances`, `describe-db-clusters`) and cross-checks against FIS action `resourceType` requirements before generating any files.
 5. **Determines monitoring configuration** — Defaults to `source: "none"` (no stop condition alarm). Only creates CloudWatch alarms if the user explicitly provides one. Generates a comprehensive CloudWatch dashboard with per-service availability, performance, and error/latency metrics.
 6. **Reads CFN resource documentation** — Before generating the CFN template, reads the `AWS::FIS::ExperimentTemplate` CloudFormation documentation to ensure the template uses the current property schema.
@@ -59,6 +59,7 @@ For AWS services that have **no native FIS action**, the skill uses `aws:ssm:sta
 Currently supported:
 - **Amazon MSK** — `kafka:RebootBroker` to test Kafka consumer/producer resilience. See `references/msk-guide.md`.
 - **Amazon ElastiCache** (primary node reboot) — `elasticache:RebootCacheCluster` to test Redis/Valkey connection pool and retry logic resilience. See `references/elasticache-redis-guide.md`.
+- **Amazon ElastiCache** (replication group failover) — `elasticache:TestFailover` to trigger automatic failover on a specific shard, promoting a replica to primary. Supports both cluster-mode-disabled and cluster-mode-enabled. See `references/elasticache-redis-guide.md`.
 
 Additional services (Redshift, Neptune, OpenSearch, MemoryDB, etc.) can be added following the same pattern — the `ssm-auto-<service>-<operation>` slug naming and two-role IAM design are documented in `references/slug-conventions.md` and `references/msk-guide.md`.
 
@@ -186,6 +187,8 @@ Step 7: Rename output directory (append experiment template ID for easy identifi
 "Test ElastiCache Redis failover in us-west-2a"
 "Reboot Redis primary node to test connection pool resilience"
 "准备 ElastiCache Redis 主节点重启的实验"
+"Test failover on ElastiCache replication group shard 0001"
+"准备 ElastiCache 复制组主备切换实验"
 ```
 
 ## Key Design Decisions
@@ -216,6 +219,8 @@ Step 7: Rename output directory (append experiment template ID for easy identifi
 
 13. **Service-specific guides for services without native FIS actions.** Amazon MSK has no native FIS action, so the skill uses `aws:ssm:start-automation-execution` to invoke an SSM Automation runbook that calls `kafka:RebootBroker` directly. This requires a two-role IAM pattern: the FIS Experiment Role (trusts `fis.amazonaws.com`) passes an SSM Automation Role (trusts `ssm.amazonaws.com`) that has the MSK API permissions. Both the SSM document and the FIS experiment template are deployed in a single CFN stack. See `references/msk-guide.md` for full details. Additional services (Redshift, Neptune, OpenSearch, etc.) can be added as separate service-specific guides following the same pattern.
 
+14. **Pre-experiment shard role detection for Redis clusters.** For ElastiCache cluster-mode-enabled replication groups, `describe-replication-groups` returns `CurrentRole` as null. The skill uses CloudWatch `IsMaster` metric to detect each node's role and records the shard distribution as a pre-experiment baseline. This enables the README to include precise expected behavior — e.g., which shards will experience primary failover in the target AZ vs. which only lose replicas.
+
 ## Directory Structure
 
 ```
@@ -229,7 +234,7 @@ aws-fis-experiment-prepare/
 │   ├── slug-conventions.md               # Scenario/context slug abbreviations, resource naming, length budget
 │   ├── eks-pod-action-guide.md           # EKS Pod action guide (Lambda + Custom Resource for K8s RBAC, auth mode, memory stress calculation)
 │   ├── az-power-interruption-guide.md    # AZ Power Interruption scenario guide (tagging, permissions, design decisions)
-│   ├── elasticache-redis-guide.md        # ElastiCache Redis/Valkey guide (native AZ power action + primary node reboot via SSM)
+│   ├── elasticache-redis-guide.md        # ElastiCache Redis/Valkey guide (native AZ power action + primary node reboot + replication group failover via SSM)
 │   └── msk-guide.md                      # Amazon MSK FIS experiment guide (broker reboot via SSM Automation)
 └── scripts/
     ├── precheck-cfn-permissions.sh       # Detects required CFN service role

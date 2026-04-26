@@ -109,10 +109,10 @@ digraph log_analysis_flow {
     "Detect mode" -> "Post-hoc mode" [label="*-experiment-results.md"];
     "Real-time mode" -> "Read service list";
     "Post-hoc mode" -> "Read service list";
-    "Read service list" -> "Auto-discover + confirm app dependencies";
-    "Auto-discover + confirm app dependencies" -> "Detect + collect managed service logs";
-    "Detect + collect managed service logs" -> "Start background log collection" [label="real-time"];
-    "Detect + collect managed service logs" -> "Batch fetch historical logs" [label="post-hoc"];
+    "Read service list" -> "Detect + collect managed service logs";
+    "Detect + collect managed service logs" -> "Auto-discover + confirm app dependencies";
+    "Auto-discover + confirm app dependencies" -> "Start background log collection" [label="real-time"];
+    "Auto-discover + confirm app dependencies" -> "Batch fetch historical logs" [label="post-hoc"];
     "Start background log collection" -> "Frontend polling + insight display";
     "Frontend polling + insight display" -> "Experiment complete?";
     "Experiment complete?" -> "Frontend polling + insight display" [label="No, continue"];
@@ -141,6 +141,45 @@ Extract affected AWS services from:
 
 Look for service name headings (e.g., "### RDS (cluster-xxx)") to build the list.
 Present the detected service list to the user.
+
+
+### Step 2.5: Detect and Collect Managed Service Logs
+
+For each affected AWS service identified in Step 2, check whether it has CloudWatch
+logging enabled. If enabled, record the log group names for later collection in Step 7.
+If not enabled, skip and note in the final report as a recommendation.
+
+**Time window note:** When called from `aws-fis-experiment-execute`, the end time
+includes a 3-minute post-experiment baseline window. Use `EXPERIMENT_END_TIME + 3 minutes`
+as the query end time to capture recovery behavior in managed service logs.
+
+**Supported managed services:** EKS Control Plane, RDS/Aurora, ElastiCache, MSK, OpenSearch.
+See `references/managed-service-log-commands.md` for check commands and log group formats.
+
+**Workflow:**
+
+1. For each service in the affected service list, extract the resource identifier from
+   the experiment template or README (cluster name, cluster ID, replication group ID, etc.)
+2. Run the check command. If logging is not enabled or the service is not present
+   in the experiment, skip it
+3. For enabled services, record the log group name(s) in `MANAGED_LOG_GROUPS` map
+   (service → list of log group names) for later use in Step 7
+4. Present detection results to the user:
+   ```
+   Managed service log detection:
+     ✅ EKS Control Plane: enabled (api, audit, scheduler) → /aws/eks/{cluster}/cluster
+     ✅ RDS Aurora: enabled (error, slowquery) → /aws/rds/cluster/{id}/error, .../slowquery
+     ❌ ElastiCache: logging not enabled (recommend enabling slow-log, engine-log)
+     ⬚ MSK: not involved in this experiment
+   ```
+
+**If logging is not enabled for a service**, record in `MANAGED_LOG_RECOMMENDATIONS`
+for the report's Recommendations section:
+```
+**{Service}:** CloudWatch logging is not enabled. Enable {log-types} for better
+fault injection analysis. Without these logs, only application-side impact is visible.
+```
+
 
 ### Step 3: Collect Application Dependencies
 
@@ -182,37 +221,55 @@ For each accessible EKS cluster, search the following sources (ordered by reliab
 **Matching logic:**
 - For each source, search for ANY string from `SERVICE_ENDPOINTS` (case-insensitive)
 - Also match common service identifier patterns:
-  - RDS: `rds`, cluster identifier, `aurora`, `mysql`, `postgres` + port 3306/5432
-  - ElastiCache: `redis`, `elasticache`, replication group ID + port 6379
-  - MSK: `kafka`, `msk`, broker endpoints + port 9092/9094
-  - OpenSearch: `opensearch`, `elasticsearch`, domain name + port 443/9200
+  - RDS: preferred cluster identifier
+  - ElastiCache: preferred cluster name
+  - MSK: preferred broker endpoints
+  - OpenSearch: preferred domain name
+- **DO NOT match** domain suffixes (e.g., `cvoce4scuiue`), ports (e.g., `3306`, `6379`),
+  or generic keywords (e.g., `rds`, `mysql`, `redis`). These are shared across multiple
+  instances and will cause false positives.
 - When a match is found, trace back to the owning **Deployment/StatefulSet/DaemonSet**
   via the pod's `ownerReferences`
 
-**Step 3a-3: Aggregate and deduplicate results**
+**Step 3a-3: Aggregate, validate, and deduplicate results**
 
-Merge results from all clusters into a single table:
+For each discovered match, **validate** by reading the actual endpoint value from the
+source (ConfigMap data, env var value, etc.) and confirming it contains the target
+resource identifier:
+
+1. Read the actual value from the matched source (ConfigMap key, env var, etc.)
+2. Check if the value contains `{RESOURCE_ID}.` (dot anchor prevents matching
+   `cluster-xxx-replica` when target is `cluster-xxx`)
+3. Mark validated matches as "verified", discard false positives
+
+**Note on Secrets:** For Priority 3 (Secrets), only inspect key names, never decode
+values. Mark matches as "⚠️ may reference" (uncertain) since key names alone cannot
+confirm the actual endpoint — these skip validation and require user confirmation.
+
+Merge validated results from all clusters into a single table:
 
 ```
 Dependency discovery results (scanned 3 clusters):
 
 EKS Cluster: eks-cluster-prod
   RDS (cluster-xxx):
-    ✅ payments/payment-api     — env: DB_HOST=cluster-xxx.abc.us-east-1.rds.amazonaws.com
+    ✅ payments/payment-api     — env: DB_HOST
+       Verified: cluster-xxx.abc.us-east-1.rds.amazonaws.com
     ✅ orders/order-service     — configmap: orders/app-config (key: spring.datasource.url)
-    ⚠️  users/user-service      — secret key: users/db-credentials (key: DB_HOST) — may reference this service
+       Verified: jdbc:mysql://cluster-xxx.abc.us-east-1.rds.amazonaws.com:3306/...
+    ❌ users/user-service       — discarded (connects to cluster-yyy, different instance)
+    ⚠️  billing/billing-api     — secret key: billing/db-credentials (key: DB_HOST) — may reference this service
 
   ElastiCache (my-redis):
-    ✅ payments/payment-api     — env: REDIS_HOST=my-redis.abc.use1.cache.amazonaws.com
+    ✅ payments/payment-api     — env: REDIS_HOST
+       Verified: my-redis.abc.use1.cache.amazonaws.com
     ✅ sessions/session-mgr     — service: sessions/redis-svc (ExternalName → my-redis.abc...)
 
 EKS Cluster: eks-cluster-staging
     ⬚ No dependencies found on affected services
-```
 
-**Note on Secrets:** For Priority 3 (Secrets), only inspect key names, never decode
-values. Mark matches as "⚠️ may reference" (uncertain) since key names alone cannot
-confirm the actual endpoint. The user must confirm these.
+Total: 4 verified, 1 discarded, 1 unverified (secret)
+```
 
 #### 3b. User Confirmation and Manual Supplement
 
@@ -229,43 +286,6 @@ SERVICE_APP_MAP:
   ElastiCache (my-redis):
     - eks-cluster-prod/payments/payment-api
     - eks-cluster-prod/sessions/session-mgr
-```
-
-### Step 3.5: Detect and Collect Managed Service Logs
-
-For each affected AWS service identified in Step 2, check whether it has CloudWatch
-logging enabled. If enabled, query logs for the experiment time window. If not enabled,
-skip and note in the final report as a recommendation.
-
-**Time window note:** When called from `aws-fis-experiment-execute`, the end time
-includes a 3-minute post-experiment baseline window. Use `EXPERIMENT_END_TIME + 3 minutes`
-as the query end time to capture recovery behavior in managed service logs.
-
-**Supported managed services:** EKS Control Plane, RDS/Aurora, ElastiCache, MSK, OpenSearch.
-See `references/managed-service-log-commands.md` for check commands and log group formats.
-
-**Workflow:**
-
-1. For each service in the affected service list, extract the resource identifier from
-   the experiment template or README (cluster name, cluster ID, replication group ID, etc.)
-2. Run the check command. If logging is not enabled or the service is not present
-   in the experiment, skip it
-3. For enabled services, record the log group name(s) in `MANAGED_LOG_GROUPS` map
-   (service → list of log group names) for later use in Step 7
-4. Present detection results to the user:
-   ```
-   Managed service log detection:
-     ✅ EKS Control Plane: enabled (api, audit, scheduler) → /aws/eks/{cluster}/cluster
-     ✅ RDS Aurora: enabled (error, slowquery) → /aws/rds/cluster/{id}/error, .../slowquery
-     ❌ ElastiCache: logging not enabled (recommend enabling slow-log, engine-log)
-     ⬚ MSK: not involved in this experiment
-   ```
-
-**If logging is not enabled for a service**, record in `MANAGED_LOG_RECOMMENDATIONS`
-for the report's Recommendations section:
-```
-**{Service}:** CloudWatch logging is not enabled. Enable {log-types} for better
-fault injection analysis. Without these logs, only application-side impact is visible.
 ```
 
 ### Step 4: Log Collection
@@ -359,7 +379,7 @@ After experiment completes (or immediately in post-hoc mode):
 
 #### Step 7a: Collect Managed Service Logs
 
-If `MANAGED_LOG_GROUPS` is non-empty (from Step 3.5), query CloudWatch Logs Insights
+If `MANAGED_LOG_GROUPS` is non-empty (from Step 2.5), query CloudWatch Logs Insights
 for each recorded log group using the experiment time window. See
 `references/managed-service-log-commands.md` for the query script and ASG activity
 collection commands.

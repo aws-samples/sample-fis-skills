@@ -37,7 +37,7 @@ Mode Detection
 Common Steps
 ├── Discover all EKS clusters in region + generate isolated kubeconfigs
 ├── Read service list from expected-behavior.md or report
-├── Deep-scan all clusters for app dependencies (env vars, ConfigMaps, Secrets, ExternalName, etc.)
+├── Deep-scan all clusters for app dependencies + validate matches against target instances
 ├── Detect and collect managed service logs (EKS/RDS/ElastiCache/MSK/OpenSearch)
 ├── Collect application logs across clusters (background streaming or batch)
 ├── Display insights (real-time) or analyze (post-hoc)

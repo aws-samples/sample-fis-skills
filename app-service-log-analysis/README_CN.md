@@ -37,7 +37,7 @@
 公共步骤
 ├── 发现 Region 内所有 EKS 集群 + 生成独立 kubeconfig
 ├── 从 expected-behavior.md 或报告读取服务列表
-├── 深度扫描所有集群的应用依赖（env vars、ConfigMap、Secrets、ExternalName 等）
+├── 深度扫描所有集群的应用依赖 + 验证匹配结果指向目标实例
 ├── 检测并收集托管服务日志（EKS/RDS/ElastiCache/MSK/OpenSearch）
 ├── 跨集群收集应用日志（后台流式或批量）
 ├── 展示洞察（实时）或分析（事后）
