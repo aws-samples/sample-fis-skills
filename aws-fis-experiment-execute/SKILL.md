@@ -211,13 +211,21 @@ on the runtime context (e.g. whether a TTY is attached, whether you can invoke
 interactive prompts, or environment signals suggesting a CI/automated run). When
 uncertain, default to interactive behavior.
 
-### Step 4: Discover EKS Applications and Start Log Collection
+### Step 3.9: Load App-Service-Log-Analysis Skill
 
 **REQUIRED:** You MUST use the `skill` tool to load the `app-service-log-analysis`
-skill NOW, before proceeding. Call: `skill(name="app-service-log-analysis")`.
-This injects the skill's instructions into your context so you can execute its
-steps. If the skill is not installed or cannot be loaded, inform the user and
-skip log collection (the experiment can still run without it).
+skill NOW. Call: `skill(name="app-service-log-analysis")`.
+
+This skill is ALWAYS required regardless of whether the user has already specified
+target pods. It handles:
+- Managed service log detection (independent of application pods)
+- Log file organization and naming conventions
+- Post-experiment analysis and report generation
+
+If the skill is not installed or cannot be loaded, inform the user and skip log
+collection (the experiment can still run without it).
+
+### Step 4: Discover EKS Applications and Start Log Collection
 
 This step runs **BEFORE** the experiment starts — discovering applications after the
 experiment begins risks missing early log entries that get rotated or overwritten.

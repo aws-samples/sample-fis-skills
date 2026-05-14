@@ -50,9 +50,11 @@ Step 3.5: Pre-experiment health check (per FIS template target)
           ├── Interactive: warn user, wait for proceed/abort/retry
           └── Non-interactive: poll every 60s, max 10 min, then abort
           ↓
+Step 3.9: Load app-service-log-analysis skill [ALWAYS — even if user specified pods]
+          ↓
 Step 4:  Discover EKS apps + start log collection [BEFORE experiment]
           ├── Check kubectl availability
-          ├── kubectl available → load app-service-log-analysis skill, execute its:
+          ├── kubectl available → execute app-service-log-analysis skill's:
           │   ├── Multi-Cluster EKS Discovery and Kubeconfig Isolation
           │   ├── Step 3 (Deep Scan for application dependencies)
           │   ├── Step 3.5 (Managed service log detection)

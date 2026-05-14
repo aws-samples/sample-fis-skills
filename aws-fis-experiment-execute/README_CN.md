@@ -50,9 +50,11 @@
           ├── 交互式：警告用户，等待 proceed/abort/retry
           └── 非交互式：每 60 秒轮询一次，最多 10 分钟后中止
           ↓
+步骤 3.9: 加载 app-service-log-analysis skill [始终执行 — 即使用户已指定 pod]
+          ↓
 步骤 4:  发现 EKS 应用 + 启动日志收集 [实验启动前完成]
           ├── 检查 kubectl 是否可用
-          ├── kubectl 可用 → 加载 app-service-log-analysis skill，执行其：
+          ├── kubectl 可用 → 执行 app-service-log-analysis skill 的：
           │   ├── Multi-Cluster EKS Discovery and Kubeconfig Isolation
           │   ├── Step 3（深度扫描应用依赖）
           │   ├── Step 3.5（托管服务日志检测）
